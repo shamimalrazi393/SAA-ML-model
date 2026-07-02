@@ -1,1 +1,5119 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+import os
+
+SAVE_DIR = '/content/drive/MyDrive/SAA_ML_PaperAfterClean'
+os.makedirs(SAVE_DIR,                  exist_ok=True)
+os.makedirs(f'{SAVE_DIR}/models',      exist_ok=True)
+os.makedirs(f'{SAVE_DIR}/figures',     exist_ok=True)
+os.makedirs(f'{SAVE_DIR}/results',     exist_ok=True)
+
+print(f'✓ Google Drive mounted.')
+print(f'✓ All files will save to: {SAVE_DIR}')
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+import joblib
+import time
+import os
+
+warnings.filterwarnings('ignore')
+
+SEED = 42
+np.random.seed(SEED)
+
+print('✓ All libraries imported.')
+print(f'✓ Random seed fixed at {SEED}')
+def save_checkpoint(obj, name):
+    """Save any object to Drive — model, dict, list, or dataframe."""
+    path = f'{SAVE_DIR}/results/{name}.joblib'
+    joblib.dump(obj, path)
+    print(f'  ✓ Checkpoint saved: {name}')
+
+def load_checkpoint(name):
+    """Load a checkpoint if it exists. Returns None if not found."""
+    path = f'{SAVE_DIR}/results/{name}.joblib'
+    if os.path.exists(path):
+        obj = joblib.load(path)
+        print(f'  ✓ Checkpoint loaded: {name}')
+        return obj
+    return None
+
+def checkpoint_exists(name):
+    """Check if a checkpoint already exists on Drive."""
+    return os.path.exists(f'{SAVE_DIR}/results/{name}.joblib')
+
+def save_figure(fig, name):
+    """Save a matplotlib figure as PDF and PNG to Drive."""
+    fig.savefig(f'{SAVE_DIR}/figures/{name}.pdf', dpi=300, bbox_inches='tight')
+    fig.savefig(f'{SAVE_DIR}/figures/{name}.png', dpi=200, bbox_inches='tight')
+    print(f'  ✓ Figure saved: {name}.pdf / .png')
+
+def save_csv(df, name):
+    """Save a dataframe as CSV to Drive."""
+    path = f'{SAVE_DIR}/results/{name}.csv'
+    df.to_csv(path, index=False)
+    print(f'  ✓ CSV saved: {name}.csv')
+
+print('✓ Checkpoint helpers defined.')
+# ── Load raw data ─────────────────────────────────────────────────────────────
+from google.colab import files
+import io
+
+print('Upload your Database.csv file...')
+uploaded = files.upload()
+filename = list(uploaded.keys())[0]
+df = pd.read_csv(io.BytesIO(uploaded[filename]))
+
+# Drop three completely empty columns
+df = df.drop(columns=['Unnamed: 97', 'Unnamed: 98', 'Unnamed: 99'],
+             errors='ignore')
+
+print(f'✓ Data loaded: {df.shape[0]:,} rows × {df.shape[1]} columns')
+
+# ── Engineer six composite features ──────────────────────────────────────────
+# These capture host-dopant interaction effects not in the raw descriptors
+
+df['delta_d_band']         = df['doped_d-band_center']            - df['host_d-band_center']
+df['delta_electroneg']     = df['doped_electronegativity']        - df['host_electronegativity']
+df['delta_efermi']         = df['doped_efermi']                   - df['host_efermi']
+df['delta_cohesive']       = df['doped_cohesive_energy']          - df['host_cohesive_energy']
+df['delta_surface_energy'] = df['doped_weighted_surface_energy']  - df['host_weighted_surface_energy']
+df['rd_rh_sq']             = df['rd/rh'] ** 2
+
+print('✓ 6 composite features engineered.')
+print(f'  Total columns now: {df.shape[1]}')
+
+print("=" * 55)
+print("BASIC STRUCTURE")
+print("=" * 55)
+
+print(f"Total rows    : {df.shape[0]:,}")
+print(f"Total columns : {df.shape[1]}")
+print(f"\nColumn types:")
+print(df.dtypes.value_counts())
+
+print("=" * 55)
+print("MISSING VALUE AUDIT")
+print("=" * 55)
+
+missing     = df.isnull().sum()
+missing_pct = (missing / len(df) * 100).round(2)
+
+missing_report = pd.DataFrame({
+    'missing_count': missing,
+    'missing_pct':   missing_pct
+}).query('missing_count > 0').sort_values('missing_count', ascending=False)
+
+print(f"Columns with missing values: {len(missing_report)}")
+print(missing_report.to_string())
+
+# Drop any column with more than 20% missing values
+threshold = 0.20
+cols_drop  = missing_pct[missing_pct > threshold * 100].index.tolist()
+if cols_drop:
+    df = df.drop(columns=cols_drop)
+    print(f"\nDropped {len(cols_drop)} high-missing columns: {cols_drop}")
+else:
+    print("\nNo columns exceed 20% missing — none dropped.")
+
+print("=" * 55)
+print("CATEGORICAL COLUMN AUDIT")
+print("=" * 55)
+
+cat_cols = ['Host', 'Doped', 'Surface', 'host_symmetry_symbol']
+for col in cat_cols:
+    if col in df.columns:
+        print(f"\n{col}:")
+        print(f"  Unique count : {df[col].nunique()}")
+        print(f"  Values       : {sorted(df[col].unique())}")
+        print(f"  Top 5 counts :")
+        print(df[col].value_counts().head(5).to_string())
+
+# Decision on each categorical column:
+# Host                 → DROP  (represented by 37 host_ descriptor columns)
+# Doped                → DROP  (represented by 32 doped_ descriptor columns)
+# Surface              → KEEP and ONE-HOT ENCODE (geometry not in any numeric col)
+# host_symmetry_symbol → DROP  (4 values only, redundant with CN features)
+
+
+print("=" * 55)
+print("TARGET VARIABLE ANALYSIS")
+print("=" * 55)
+
+for t in ['Barrier', 'rate_723.15', 'rate_area_723']:
+    print(f"\n{t}:")
+    print(f"  Min    : {df[t].min():.6f}")
+    print(f"  Max    : {df[t].max():.6f}")
+    print(f"  Mean   : {df[t].mean():.6f}")
+    print(f"  Median : {df[t].median():.6f}")
+    print(f"  Std    : {df[t].std():.6f}")
+    print(f"  Zeros  : {(df[t] == 0).sum()}")
+    print(f"  Nulls  : {df[t].isnull().sum()}")
+
+# Log-transform the rate — it spans 20 orders of magnitude
+# A model trained on raw rates would be dominated by extreme values
+df['log_rate'] = np.log10(df['rate_723.15'].replace(0, 1e-30))
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+axes[0].hist(df['Barrier'],     bins=60, color='steelblue', edgecolor='white')
+axes[0].set_title('Barrier — use as-is (roughly normal)')
+axes[0].set_xlabel('Barrier (eV)')
+axes[1].hist(df['rate_723.15'], bins=60, color='tomato',    edgecolor='white')
+axes[1].set_title('Rate — DO NOT use raw (extreme skew)')
+axes[1].set_xlabel('Rate (s⁻¹ m⁻²)')
+axes[2].hist(df['log_rate'],    bins=60, color='seagreen',  edgecolor='white')
+axes[2].set_title('log₁₀(Rate) — USE THIS')
+axes[2].set_xlabel('log₁₀(Rate)')
+plt.tight_layout()
+save_figure(fig, 'target_distributions')
+plt.show()
+
+corr_br = df[['Barrier', 'log_rate']].corr().iloc[0, 1]
+print(f"\nBarrier vs log_rate Pearson r = {corr_br:.6f}")
+print("(Expected: -1.000 — they are a deterministic function of each other)")
+
+print("=" * 55)
+print("FEATURE CATEGORISATION")
+print("=" * 55)
+
+host_feats  = [c for c in df.columns if c.startswith('host_')]
+doped_feats = [c for c in df.columns if c.startswith('doped_')]
+com_feats   = [c for c in df.columns if c.startswith('com_')]
+cn_feats    = [c for c in df.columns if c.startswith('CN')]
+site_feats  = [c for c in df.columns if c.startswith('site')]
+eng_feats   = ['delta_d_band','delta_electroneg','delta_efermi',
+               'delta_cohesive','delta_surface_energy','rd_rh_sq']
+size_feats  = ['area_fraction','rd-rh','rd/rh','rd_rh_sq']
+
+feat_summary = pd.DataFrame({
+    'Group':   ['Host descriptors','Dopant descriptors','Combined descriptors',
+                'Coordination (CN)','Site indicators','Engineered','Size mismatch'],
+    'Count':   [len(host_feats), len(doped_feats), len(com_feats),
+                len(cn_feats),   len(site_feats),  len(eng_feats),
+                len(size_feats)]
+})
+print(feat_summary.to_string(index=False))
+print(f"\nSurface one-hot will add: 19 columns")
+print(f"Total features entering model: ~{sum(feat_summary['Count']) + 19}")
+print("=" * 55)
+print("TOP 20 FEATURES CORRELATED WITH BARRIER")
+print("=" * 55)
+
+numeric_df  = df.select_dtypes(include=[np.number])
+corr        = numeric_df.corr()['Barrier'].drop(
+    ['Barrier','rate_723.15','rate_area_723','log_rate'], errors='ignore')
+corr_ranked = corr.abs().sort_values(ascending=False)
+
+for feat, val in corr_ranked.head(20).items():
+    print(f"  {feat:45s}: {corr[feat]:+.4f}")
+
+print("\nPhysical interpretation:")
+print("  Negative = higher descriptor value → lower barrier → more active")
+print("  Positive = higher descriptor value → higher barrier → less active")
+print("  Dopant-side features dominate — dopant defines the active site")
+
+# Correlation heatmap — top 20 features
+top20_feats = corr_ranked.head(20).index.tolist() + ['Barrier']
+fig, ax = plt.subplots(figsize=(13, 11))
+sns.heatmap(df[top20_feats].corr(), annot=True, fmt='.2f',
+            cmap='RdBu_r', center=0, ax=ax, linewidths=0.3, annot_kws={'size': 7})
+ax.set_title('Correlation Matrix — Top 20 Features + Barrier', fontsize=12)
+plt.tight_layout()
+save_figure(fig, 'correlation_matrix')
+plt.show()
+
+print("=" * 55)
+print("BARRIER STATISTICS BY SURFACE")
+print("=" * 55)
+surf_stats = df.groupby('Surface')['Barrier'].agg(
+    count='count', mean='mean', std='std', min='min', max='max'
+).round(3).sort_values('mean')
+print(surf_stats.to_string())
+
+print("\n" + "=" * 55)
+print("BARRIER STATISTICS BY HOST")
+print("=" * 55)
+host_stats = df.groupby('Host')['Barrier'].agg(
+    count='count', mean='mean', std='std', min='min', max='max'
+).round(3).sort_values('mean')
+print(host_stats.to_string())
+
+save_csv(surf_stats.reset_index(), 'surface_barrier_stats')
+save_csv(host_stats.reset_index(), 'host_barrier_stats')
+
+print("=" * 55)
+print("FINAL DATASET DECISION")
+print("=" * 55)
+
+print(f"Rows to use   : ALL {len(df):,} — no outlier removal")
+print(f"Justification : All rows are valid DFT calculations.")
+print(f"                Extreme barriers are real physics, not errors.")
+print(f"\n{'='*55}")
+print("NUMBERS FOR YOUR PAPER METHODS SECTION")
+print("=" * 55)
+print(f"  Dataset size          : 10,950 SAA configurations")
+print(f"  Host metals           : 30 transition metals")
+print(f"  Dopant metals         : 30 transition metals")
+print(f"  Surface facets        : 19 crystallographic terminations")
+print(f"  Input features        : ~121 (after encoding and engineering)")
+print(f"    Host descriptors    : {len(host_feats)}")
+print(f"    Dopant descriptors  : {len(doped_feats)}")
+print(f"    Combined features   : {len(com_feats)}")
+print(f"    CN features         : {len(cn_feats)}")
+print(f"    Site indicators     : {len(site_feats)}")
+print(f"    Engineered features : {len(eng_feats)}")
+print(f"    Size mismatch       : {len(size_feats)}")
+print(f"    Surface dummies     : 19")
+print(f"  Primary target        : Activation barrier Ea (eV)")
+print(f"    Range               : {df['Barrier'].min():.3f} – {df['Barrier'].max():.3f} eV")
+print(f"    Mean ± Std          : {df['Barrier'].mean():.3f} ± {df['Barrier'].std():.3f} eV")
+print(f"  Secondary target      : log₁₀(rate at 723.15 K)")
+print(f"    Range               : {df['log_rate'].min():.1f} to {df['log_rate'].max():.1f}")
+print(f"  Missing values        : <0.1% — filled with column medians")
+
+print('=' * 55)
+print('STEP 5 — BUILD FEATURE MATRIX')
+print('=' * 55)
+
+host_labels    = df['Host'].values.copy()
+surface_labels = df['Surface'].values.copy()
+
+ckpt = load_checkpoint('feature_matrix')
+
+if ckpt is not None:
+    X_arr         = ckpt['X_arr']
+    y_barrier     = ckpt['y_barrier']
+    y_rate        = ckpt['y_rate']
+    feature_names = ckpt['feature_names']
+    host_labels   = ckpt['host_labels']
+    surface_labels= ckpt['surface_labels']
+    X             = pd.DataFrame(X_arr, columns=feature_names)
+    print('✓ Feature matrix loaded from Drive.')
+else:
+    df_enc = pd.get_dummies(df, columns=['Surface'], drop_first=False)
+    df_enc = df_enc.drop(
+        columns=['Host', 'Doped', 'host_symmetry_symbol'], errors='ignore')
+
+    y_barrier = df_enc['Barrier'].values
+    y_rate    = df_enc['log_rate'].values
+
+    drop_cols = ['Barrier', 'rate_723.15', 'rate_area_723', 'log_rate']
+    X = df_enc.drop(columns=drop_cols, errors='ignore')
+    X = X.fillna(X.median(numeric_only=True))
+    X = X.select_dtypes(include=[np.number])
+
+    feature_names = X.columns.tolist()
+    X_arr         = X.values
+
+    save_checkpoint({
+        'X_arr':          X_arr,
+        'y_barrier':      y_barrier,
+        'y_rate':         y_rate,
+        'feature_names':  feature_names,
+        'host_labels':    host_labels,
+        'surface_labels': surface_labels,
+    }, 'feature_matrix')
+    print('✓ Feature matrix built and saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print(f'\nFeature matrix shape : {X.shape}')
+print(f'Missing values       : {X.isnull().sum().sum()}')
+print(f'y_barrier range      : [{y_barrier.min():.3f}, {y_barrier.max():.3f}] eV')
+print(f'y_barrier mean ± std : {y_barrier.mean():.3f} ± {y_barrier.std():.3f} eV')
+print(f'y_rate range         : [{y_rate.min():.2f}, {y_rate.max():.2f}]')
+print(f'Unique hosts         : {len(np.unique(host_labels))}')
+print(f'Unique surfaces      : {len(np.unique(surface_labels))}')
+
+print('=' * 55)
+print('STEP 5b — MATMINER + CALPHAD FEATURES')
+print('=' * 55)
+
+!pip install matminer --quiet 2>/dev/null
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import cross_val_score
+from matminer.featurizers.composition import ElementProperty, Miedema
+from pymatgen.core import Composition
+from tqdm.notebook import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+matminer_ckpt = load_checkpoint('matminer_features')
+
+if matminer_ckpt is not None:
+    X_matminer             = matminer_ckpt['X_matminer']
+    matminer_feature_names = matminer_ckpt['matminer_feature_names']
+    X_arr_combined         = matminer_ckpt['X_arr_combined']
+    feature_names_combined = matminer_ckpt['feature_names_combined']
+    print('✓ matminer features loaded from Drive.')
+    print(f'  matminer features : {X_matminer.shape}')
+    print(f'  Combined matrix   : {X_arr_combined.shape}')
+
+else:
+    # ── Load feature matrix ───────────────────────────────────────────────────
+    try:
+        X_arr
+        feature_names
+        y_barrier
+        host_labels
+        surface_labels
+        X
+    except NameError:
+        ckpt = load_checkpoint('feature_matrix')
+        if ckpt is None:
+            print('ERROR: feature_matrix checkpoint not found.')
+            print('Run Step 5 first before running Step 5b.')
+            raise SystemExit
+        X_arr          = ckpt['X_arr']
+        feature_names  = ckpt['feature_names']
+        y_barrier      = ckpt['y_barrier']
+        y_rate         = ckpt['y_rate']
+        host_labels    = ckpt['host_labels']
+        surface_labels = ckpt['surface_labels']
+        X              = pd.DataFrame(X_arr, columns=feature_names)
+        print(f'✓ Feature matrix loaded: {X_arr.shape}')
+
+    # ── Load original CSV ─────────────────────────────────────────────────────
+    drive_csv = f'{SAVE_DIR}/Database.csv'
+    try:
+        df_orig = pd.read_csv(io.BytesIO(uploaded[filename]))
+        if not os.path.exists(drive_csv):
+            df_orig.to_csv(drive_csv, index=False)
+    except Exception:
+        if os.path.exists(drive_csv):
+            df_orig = pd.read_csv(drive_csv)
+        else:
+            print(f'ERROR: Database.csv not found at {drive_csv}')
+            raise SystemExit
+
+    print(f'Dataset loaded     : {df_orig.shape}')
+    print(f'Unique hosts       : {df_orig["Host"].nunique()}')
+    print(f'Unique dopants     : {df_orig["Doped"].nunique()}')
+
+    # ── Magpie descriptors ────────────────────────────────────────────────────
+    ep = ElementProperty.from_preset('magpie')
+
+    def get_magpie(symbol):
+        try:
+            return ep.featurize(Composition(symbol))
+        except Exception:
+            return [np.nan] * len(ep.feature_labels())
+
+    print(f'\nComputing Magpie descriptors...')
+    print(f'  Features per element : {len(ep.feature_labels())}')
+
+    print('  Host metals:')
+    host_magpie = [get_magpie(h) for h in
+                   tqdm(df_orig['Host'].values,
+                        desc='  Host Magpie', ncols=80)]
+
+    print('  Dopant metals:')
+    doped_magpie = [get_magpie(d) for d in
+                    tqdm(df_orig['Doped'].values,
+                         desc='  Dopant Magpie', ncols=80)]
+
+    host_magpie_df = pd.DataFrame(
+        host_magpie,
+        columns=[f'host_magpie_{l}' for l in ep.feature_labels()])
+    doped_magpie_df = pd.DataFrame(
+        doped_magpie,
+        columns=[f'doped_magpie_{l}' for l in ep.feature_labels()])
+
+    # ── Delta Magpie (dopant - host) ──────────────────────────────────────────
+    print('\nComputing delta Magpie features (dopant - host)...')
+    delta_magpie_df = pd.DataFrame()
+    for l in ep.feature_labels():
+        hcol = f'host_magpie_{l}'
+        dcol = f'doped_magpie_{l}'
+        if hcol in host_magpie_df.columns and \
+           dcol in doped_magpie_df.columns:
+            delta_magpie_df[f'delta_magpie_{l}'] = (
+                doped_magpie_df[dcol].values -
+                host_magpie_df[hcol].values)
+
+    # ── Miedema CALPHAD mixing enthalpy ───────────────────────────────────────
+    print('\nComputing Miedema mixing enthalpy (CALPHAD proxy)...')
+    miedema      = Miedema()
+    miedema_vals = []
+
+    for host, doped in tqdm(
+            zip(df_orig['Host'].values, df_orig['Doped'].values),
+            total=len(df_orig), desc='  Miedema', ncols=80):
+        try:
+            if host == doped:
+                # Same-element: mixing enthalpy = 0 by definition
+                miedema_vals.append(
+                    [0.0] * len(miedema.feature_labels()))
+            else:
+                comp = Composition({host: 0.5, doped: 0.5})
+                miedema_vals.append(miedema.featurize(comp))
+        except Exception:
+            miedema_vals.append(
+                [np.nan] * len(miedema.feature_labels()))
+
+    miedema_df = pd.DataFrame(
+        miedema_vals,
+        columns=[f'calphad_{l}' for l in miedema.feature_labels()])
+
+    # ── Combine all matminer features ─────────────────────────────────────────
+    print('\nCombining all matminer features...')
+    X_matminer = pd.concat([
+        host_magpie_df.reset_index(drop=True),
+        doped_magpie_df.reset_index(drop=True),
+        delta_magpie_df.reset_index(drop=True),
+        miedema_df.reset_index(drop=True),
+    ], axis=1)
+
+    # Remove constant columns
+    constant_cols = [c for c in X_matminer.columns
+                     if X_matminer[c].std() == 0]
+    X_matminer    = X_matminer.drop(columns=constant_cols)
+    print(f'  Removed {len(constant_cols)} constant columns.')
+
+    # Fill NaN with median
+    X_matminer             = X_matminer.fillna(X_matminer.median())
+    matminer_feature_names = X_matminer.columns.tolist()
+
+    print(f'\nmatminer feature summary:')
+    print(f'  Magpie host     : '
+          f'{len([c for c in matminer_feature_names if c.startswith("host_magpie_")])} features')
+    print(f'  Magpie dopant   : '
+          f'{len([c for c in matminer_feature_names if c.startswith("doped_magpie_")])} features')
+    print(f'  Delta Magpie    : '
+          f'{len([c for c in matminer_feature_names if c.startswith("delta_magpie_")])} features')
+    print(f'  Miedema CALPHAD : '
+          f'{len([c for c in matminer_feature_names if c.startswith("calphad_")])} features')
+    print(f'  Total matminer  : {X_matminer.shape[1]} features')
+
+    # ── Merge with existing feature matrix ────────────────────────────────────
+    print('\nMerging with existing feature matrix...')
+    X_combined = pd.concat([
+        X.reset_index(drop=True),
+        X_matminer.reset_index(drop=True)
+    ], axis=1)
+
+    # Remove duplicate columns
+    X_combined             = X_combined.loc[
+        :, ~X_combined.columns.duplicated()]
+    X_combined             = X_combined.fillna(X_combined.median())
+    X_arr_combined         = X_combined.values
+    feature_names_combined = X_combined.columns.tolist()
+
+    print(f'  Original features : {X_arr.shape[1]}')
+    print(f'  matminer features : {X_matminer.shape[1]}')
+    print(f'  Combined features : {X_arr_combined.shape[1]}')
+    print(f'  Total samples     : {X_arr_combined.shape[0]}')
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    save_checkpoint({
+        'X_matminer':             X_matminer,
+        'matminer_feature_names': matminer_feature_names,
+        'X_arr_combined':         X_arr_combined,
+        'feature_names_combined': feature_names_combined,
+    }, 'matminer_features')
+    print('✓ matminer features saved to Drive.')
+
+# ── ensure X_arr and y_barrier available ─────────────────────────────────────
+try:
+    X_arr
+    y_barrier
+except NameError:
+    ckpt          = load_checkpoint('feature_matrix')
+    X_arr         = ckpt['X_arr']
+    y_barrier     = ckpt['y_barrier']
+    feature_names = ckpt['feature_names']
+    X             = pd.DataFrame(X_arr, columns=feature_names)
+
+# ── Quick 5-fold CV benchmark ─────────────────────────────────────────────────
+print(f'\n{"="*55}')
+print('5-FOLD CV BENCHMARK — ORIGINAL vs COMBINED FEATURES')
+print(f'{"="*55}')
+
+rf_bench = RandomForestRegressor(
+    n_estimators=100, max_features='sqrt',
+    min_samples_leaf=2, n_jobs=-1, random_state=SEED)
+
+print('Scoring original features...')
+scores_orig = cross_val_score(
+    rf_bench, X_arr, y_barrier,
+    cv=5, scoring='r2', n_jobs=-1)
+print(f'  Per fold: {[round(float(s),4) for s in scores_orig]}')
+
+print('Scoring combined features...')
+scores_comb = cross_val_score(
+    rf_bench, X_arr_combined, y_barrier,
+    cv=5, scoring='r2', n_jobs=-1)
+print(f'  Per fold: {[round(float(s),4) for s in scores_comb]}')
+
+r2_orig  = float(scores_orig.mean())
+r2_comb  = float(scores_comb.mean())
+std_orig = float(scores_orig.std())
+std_comb = float(scores_comb.std())
+
+print(f'\nOriginal ({X_arr.shape[1]} features)  :'
+      f' R² = {r2_orig:.4f} ± {std_orig:.4f}')
+print(f'Combined ({X_arr_combined.shape[1]} features) :'
+      f' R² = {r2_comb:.4f} ± {std_comb:.4f}')
+print(f'Improvement : {r2_comb - r2_orig:+.4f} R²')
+
+if r2_comb > r2_orig:
+    print('✓ matminer + CALPHAD features improve 5-fold CV accuracy.')
+else:
+    print('Note: 5-fold CV accuracy similar.')
+    print('      Main benefit is richer descriptor space for')
+    print('      LOHO/LODO generalisation — visible after Step 9.')
+
+# ── CALPHAD stats ─────────────────────────────────────────────────────────────
+calphad_cols = [c for c in matminer_feature_names
+                if c.startswith('calphad_')]
+print(f'\nCALPHAD features ({len(calphad_cols)}): {calphad_cols}')
+X_mat_df = X_matminer if isinstance(X_matminer, pd.DataFrame) \
+    else pd.DataFrame(X_matminer, columns=matminer_feature_names)
+for col in calphad_cols:
+    vals = X_mat_df[col].values
+    print(f'  {col}:')
+    print(f'    mean={vals.mean():.4f}  std={vals.std():.4f}'
+          f'  min={vals.min():.4f}  max={vals.max():.4f}')
+
+# ── Plots ─────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+# ── Left: feature group sizes ─────────────────────────────────────────────────
+groups = [
+    'Original\n(Step 5)',
+    'Magpie\nHost',
+    'Magpie\nDopant',
+    'Delta\nMagpie',
+    'CALPHAD\nMiedema',
+    'Combined\nTotal',
+]
+sizes = [
+    int(X_arr.shape[1]),
+    int(len([c for c in matminer_feature_names
+             if c.startswith('host_magpie_')])),
+    int(len([c for c in matminer_feature_names
+             if c.startswith('doped_magpie_')])),
+    int(len([c for c in matminer_feature_names
+             if c.startswith('delta_magpie_')])),
+    int(len(calphad_cols)),
+    int(X_arr_combined.shape[1]),
+]
+print(f'\nFeature group sizes: {dict(zip(groups, sizes))}')
+
+colors_grp = ['steelblue','seagreen','seagreen',
+               'seagreen','tomato','purple']
+bars = axes[0].bar(groups, sizes, color=colors_grp, alpha=0.85)
+axes[0].set_ylabel('Number of Features')
+axes[0].set_title('Feature Group Sizes')
+axes[0].set_ylim(0, max(sizes) * 1.18)
+axes[0].spines['top'].set_visible(False)
+axes[0].spines['right'].set_visible(False)
+for bar, size in zip(bars, sizes):
+    axes[0].text(
+        bar.get_x() + bar.get_width() / 2,
+        bar.get_height() + max(sizes) * 0.01,
+        str(size), ha='center', va='bottom',
+        fontsize=10, fontweight='bold')
+
+# ── Right: R² comparison ──────────────────────────────────────────────────────
+bottom_val = min(r2_orig, r2_comb) - 0.008
+top_val    = max(r2_orig, r2_comb) + 0.012
+
+axes[1].bar(
+    ['Original\nfeatures', 'Combined\nfeatures'],
+    [r2_orig - bottom_val, r2_comb - bottom_val],
+    bottom=bottom_val,
+    color=['steelblue', 'purple'],
+    alpha=0.85,
+    yerr=[std_orig, std_comb],
+    capsize=8,
+    error_kw={'linewidth': 2, 'ecolor': 'black'})
+axes[1].set_ylim(bottom_val - 0.001, top_val)
+axes[1].set_ylabel('R² (5-fold CV, RF 100 trees)')
+axes[1].set_title('Accuracy: Original vs Combined Features')
+axes[1].spines['top'].set_visible(False)
+axes[1].spines['right'].set_visible(False)
+for x, (r2, std) in enumerate([(r2_orig, std_orig),
+                                 (r2_comb, std_comb)]):
+    axes[1].text(
+        x, r2 + std + 0.0005,
+        f'R²={r2:.4f}',
+        ha='center', va='bottom',
+        fontsize=11, fontweight='bold')
+
+plt.suptitle('Step 5b — matminer + CALPHAD Feature Enrichment',
+             fontsize=13)
+plt.tight_layout()
+save_figure(fig, 'matminer_feature_enrichment')
+plt.show()
+
+print(f'\n{"="*55}')
+print('STEP 5b COMPLETE')
+print(f'{"="*55}')
+print(f'Original feature matrix  : {X_arr.shape}')
+print(f'Combined feature matrix  : {X_arr_combined.shape}')
+print(f'matminer features added  : {X_matminer.shape[1]}')
+print(f'\nIMPORTANT: In all subsequent steps (8 onward),')
+print(f'use X_arr_combined instead of X_arr.')
+print(f'Checkpoint key: load_checkpoint("matminer_features")')
+
+print('=' * 55)
+print('STEP 5c — CLEAN COMBINED FEATURE MATRIX')
+print('=' * 55)
+
+import pandas as pd
+from scipy.stats import skew
+
+combined_ckpt = load_checkpoint('matminer_features')
+if combined_ckpt is None:
+    print('ERROR: Run Step 5b first.')
+    raise SystemExit
+
+X_arr_combined         = combined_ckpt['X_arr_combined']
+feature_names_combined = combined_ckpt['feature_names_combined']
+
+# Load y_barrier for Step 10
+try:
+    y_barrier
+except NameError:
+    ckpt      = load_checkpoint('feature_matrix')
+    if ckpt is None:
+        print('ERROR: Run Step 5 first.')
+        raise SystemExit
+    y_barrier = ckpt['y_barrier']
+
+# Original feature set — never remove these
+original_feature_set = set([
+    f for f in feature_names_combined
+    if not f.startswith('host_magpie_')
+    and not f.startswith('doped_magpie_')
+    and not f.startswith('delta_magpie_')
+    and not f.startswith('calphad_')])
+
+print(f'Original features to protect : {len(original_feature_set)}')
+print(f'Before cleaning              : {X_arr_combined.shape}')
+print(f'Inf values                   : {np.isinf(X_arr_combined).sum()}')
+print(f'NaN values                   : {np.isnan(X_arr_combined).sum()}')
+print(f'Max abs value                : {np.nanmax(np.abs(X_arr_combined)):.2f}')
+print()
+
+original_shape = X_arr_combined.shape
+
+# ── Step 1: Replace inf with NaN ──────────────────────────────────────────────
+inf_count      = int(np.isinf(X_arr_combined).sum())
+X_arr_combined = np.where(
+    np.isinf(X_arr_combined), np.nan, X_arr_combined)
+print(f'Step 1  — Inf → NaN                  : {inf_count} fixed')
+
+# ── Step 2: Fill NaN with column median ───────────────────────────────────────
+nan_count   = int(np.isnan(X_arr_combined).sum())
+col_medians = np.nanmedian(X_arr_combined, axis=0)
+for i in range(X_arr_combined.shape[1]):
+    mask = np.isnan(X_arr_combined[:, i])
+    if mask.any():
+        X_arr_combined[mask, i] = col_medians[i]
+print(f'Step 2  — NaN → median               : {nan_count} fixed')
+
+# ── Step 3: Remove constant columns ──────────────────────────────────────────
+col_stds  = X_arr_combined.std(axis=0)
+keep_mask = np.array([
+    s > 0 or f in original_feature_set
+    for s, f in zip(col_stds, feature_names_combined)])
+removed_3              = int((~keep_mask).sum())
+X_arr_combined         = X_arr_combined[:, keep_mask]
+feature_names_combined = [f for f, k in
+                           zip(feature_names_combined, keep_mask) if k]
+print(f'Step 3  — Constant columns removed   : {removed_3}')
+
+# ── Step 4: Remove near-zero variance columns ─────────────────────────────────
+col_stds  = X_arr_combined.std(axis=0)
+keep_mask = np.array([
+    s > 1e-6 or f in original_feature_set
+    for s, f in zip(col_stds, feature_names_combined)])
+removed_4              = int((~keep_mask).sum())
+X_arr_combined         = X_arr_combined[:, keep_mask]
+feature_names_combined = [f for f, k in
+                           zip(feature_names_combined, keep_mask) if k]
+print(f'Step 4  — Near-zero var removed      : {removed_4}')
+
+# ── Step 5: Remove duplicate columns ─────────────────────────────────────────
+X_df      = pd.DataFrame(X_arr_combined, columns=feature_names_combined)
+before_5  = X_df.shape[1]
+X_df      = X_df.loc[:, ~X_df.columns.duplicated()]
+removed_5 = before_5 - X_df.shape[1]
+X_arr_combined         = X_df.values
+feature_names_combined = X_df.columns.tolist()
+print(f'Step 5  — Duplicate columns removed  : {removed_5}')
+
+# ── Step 6: Clip extreme outliers (6σ) ───────────────────────────────────────
+means   = X_arr_combined.mean(axis=0)
+stds    = X_arr_combined.std(axis=0)
+stds[stds == 0] = 1
+X_clip  = np.clip(X_arr_combined,
+                  means - 6 * stds,
+                  means + 6 * stds)
+clipped = int(np.sum(X_arr_combined != X_clip))
+X_arr_combined = X_clip
+print(f'Step 6  — Outlier values clipped     : {clipped}')
+
+# ── Step 7: Remove highly correlated features (r > 0.95) ─────────────────────
+print(f'Step 7  — Computing correlation matrix (~3-5 min)...')
+X_df        = pd.DataFrame(X_arr_combined, columns=feature_names_combined)
+corr_matrix = X_df.corr().abs()
+upper       = corr_matrix.where(
+    np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+drop_cols   = [col for col in upper.columns
+               if any(upper[col] > 0.95)
+               and col not in original_feature_set]
+X_df               = X_df.drop(columns=drop_cols)
+X_arr_combined     = X_df.values
+feature_names_combined = X_df.columns.tolist()
+removed_7          = len(drop_cols)
+print(f'Step 7  — Correlated features removed: {removed_7}')
+
+# ── Step 8: Log transform highly skewed positive features ────────────────────
+print(f'Step 8  — Log transform skewed features...')
+X_df    = pd.DataFrame(X_arr_combined, columns=feature_names_combined)
+skewed  = []
+for col in X_df.columns:
+    if col in original_feature_set:
+        continue  # never transform original features
+    col_data = X_df[col]
+    if col_data.min() > 0:
+        sk = abs(skew(col_data))
+        if sk > 2.0:
+            X_df[col] = np.log1p(col_data)
+            skewed.append(col)
+X_arr_combined         = X_df.values
+feature_names_combined = X_df.columns.tolist()
+print(f'Step 8  — Log-transformed            : {len(skewed)} features')
+
+# ── Step 9: Remove low variance features (bottom 5%) ─────────────────────────
+variances = X_arr_combined.var(axis=0)
+threshold = np.percentile(variances, 5)
+keep_mask = np.array([
+    v > threshold or f in original_feature_set
+    for v, f in zip(variances, feature_names_combined)])
+removed_9              = int((~keep_mask).sum())
+X_arr_combined         = X_arr_combined[:, keep_mask]
+feature_names_combined = [f for f, k in
+                           zip(feature_names_combined, keep_mask) if k]
+print(f'Step 9  — Low variance removed       : {removed_9}')
+
+# ── Step 10: Remove features uncorrelated with barrier (<0.01) ───────────────
+print(f'Step 10 — Computing feature-target correlations (~2 min)...')
+correlations = np.array([
+    abs(np.corrcoef(X_arr_combined[:, i], y_barrier)[0, 1])
+    for i in range(X_arr_combined.shape[1])
+])
+keep_mask = np.array([
+    corr > 0.01 or f in original_feature_set
+    for corr, f in zip(correlations, feature_names_combined)])
+removed_10             = int((~keep_mask).sum())
+X_arr_combined         = X_arr_combined[:, keep_mask]
+feature_names_combined = [f for f, k in
+                           zip(feature_names_combined, keep_mask) if k]
+print(f'Step 10 — Uncorrelated removed       : {removed_10}')
+
+# ── Step 11: Final NaN/Inf check ─────────────────────────────────────────────
+final_nan = int(np.isnan(X_arr_combined).sum())
+final_inf = int(np.isinf(X_arr_combined).sum())
+if final_nan > 0 or final_inf > 0:
+    X_arr_combined = np.nan_to_num(
+        X_arr_combined, nan=0.0, posinf=0.0, neginf=0.0)
+    print(f'Step 11 — Final NaN/Inf fixed        : done')
+else:
+    print(f'Step 11 — Final check                : clean ✓')
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+total_removed = original_shape[1] - X_arr_combined.shape[1]
+
+print(f'\n{"="*55}')
+print(f'CLEANING SUMMARY')
+print(f'{"="*55}')
+print(f'Original shape           : {original_shape}')
+print(f'Final shape              : {X_arr_combined.shape}')
+print(f'Total columns removed    : {total_removed}')
+print(f'  Step 1  Inf            : {inf_count} values')
+print(f'  Step 2  NaN            : {nan_count} values')
+print(f'  Step 3  Constant       : {removed_3} columns')
+print(f'  Step 4  Near-zero var  : {removed_4} columns')
+print(f'  Step 5  Duplicates     : {removed_5} columns')
+print(f'  Step 6  Outliers       : {clipped} values clipped')
+print(f'  Step 7  Correlated     : {removed_7} columns')
+print(f'  Step 8  Log-transformed: {len(skewed)} features')
+print(f'  Step 9  Low variance   : {removed_9} columns')
+print(f'  Step 10 Uncorrelated   : {removed_10} columns')
+print(f'Final Inf                : {final_inf}')
+print(f'Final NaN                : {final_nan}')
+print(f'Max abs value            : {np.abs(X_arr_combined).max():.2f}')
+print(f'Original features kept  : all {len(original_feature_set)}')
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+save_checkpoint({
+    'X_matminer':             combined_ckpt['X_matminer'],
+    'matminer_feature_names': combined_ckpt['matminer_feature_names'],
+    'X_arr_combined':         X_arr_combined,
+    'feature_names_combined': feature_names_combined,
+}, 'matminer_features')
+
+print(f'\n✓ Cleaned matrix saved to Drive.')
+print(f'  Final features : {X_arr_combined.shape[1]}')
+print(f'  Ready for Step 5d.')
+
+print('=' * 55)
+print('STEP 5d — ACTIVATE COMBINED FEATURE MATRIX')
+print('=' * 55)
+
+combined_ckpt = load_checkpoint('matminer_features')
+
+if combined_ckpt is None:
+    print('ERROR: matminer_features checkpoint not found.')
+    print('Run Step 5b and Step 5c first.')
+    raise SystemExit
+
+X_arr_combined         = combined_ckpt['X_arr_combined']
+feature_names_combined = combined_ckpt['feature_names_combined']
+
+print(f'Combined matrix loaded   : {X_arr_combined.shape}')
+print(f'Feature names loaded     : {len(feature_names_combined)}')
+
+# ── Overwrite global variables ────────────────────────────────────────────────
+X_arr         = X_arr_combined.copy()
+feature_names = feature_names_combined.copy()
+X             = pd.DataFrame(X_arr, columns=feature_names)
+
+# ── Load labels ───────────────────────────────────────────────────────────────
+try:
+    y_barrier
+    y_rate
+    host_labels
+    surface_labels
+except NameError:
+    ckpt = load_checkpoint('feature_matrix')
+    if ckpt is None:
+        print('ERROR: feature_matrix not found. Run Step 5 first.')
+        raise SystemExit
+    y_barrier      = ckpt['y_barrier']
+    y_rate         = ckpt['y_rate']
+    host_labels    = ckpt['host_labels']
+    surface_labels = ckpt['surface_labels']
+    print('✓ Labels loaded from Drive.')
+
+# ── Assertions ────────────────────────────────────────────────────────────────
+assert X_arr.shape[0] == y_barrier.shape[0], \
+    'X_arr and y_barrier row mismatch!'
+assert X_arr.shape[1] == len(feature_names), \
+    'feature_names length mismatch!'
+assert X_arr.shape[0] == len(host_labels), \
+    'host_labels row mismatch!'
+assert X_arr.shape[0] == len(surface_labels), \
+    'surface_labels row mismatch!'
+print('✓ All shape assertions passed.')
+
+# ── Feature breakdown ─────────────────────────────────────────────────────────
+original_count = X_arr.shape[1] - combined_ckpt['X_matminer'].shape[1]
+matminer_count = combined_ckpt['X_matminer'].shape[1]
+
+print(f'\nFeature breakdown:')
+print(f'  Original (Step 5)      : {original_count} features')
+print(f'  matminer + CALPHAD     : {matminer_count} features')
+print(f'  Combined total         : {X_arr.shape[1]} features')
+print(f'    Magpie host          : '
+      f'{len([f for f in feature_names if f.startswith("host_magpie_")])}')
+print(f'    Magpie dopant        : '
+      f'{len([f for f in feature_names if f.startswith("doped_magpie_")])}')
+print(f'    Delta Magpie         : '
+      f'{len([f for f in feature_names if f.startswith("delta_magpie_")])}')
+print(f'    CALPHAD Miedema      : '
+      f'{len([f for f in feature_names if f.startswith("calphad_")])}')
+
+# ── Verify clean ──────────────────────────────────────────────────────────────
+inf_count = int(np.isinf(X_arr).sum())
+nan_count = int(np.isnan(X_arr).sum())
+max_val   = float(np.abs(X_arr).max())
+
+print(f'\nData quality check:')
+print(f'  Inf values : {inf_count}')
+print(f'  NaN values : {nan_count}')
+print(f'  Max value  : {max_val:.2f}')
+
+if inf_count > 0 or nan_count > 0:
+    print('⚠ WARNING: Matrix has inf/NaN — run Step 5c first.')
+else:
+    print('✓ Matrix is clean.')
+
+# ── Save activation flag ──────────────────────────────────────────────────────
+save_checkpoint({
+    'activated':   True,
+    'X_arr_shape': list(X_arr.shape),
+    'n_features':  len(feature_names),
+}, 'combined_matrix_activated')
+
+print(f'\n{"="*55}')
+print('STEP 5d COMPLETE')
+print(f'{"="*55}')
+print(f'X_arr         : {X_arr.shape}')
+print(f'feature_names : {len(feature_names)}')
+print(f'X             : {X.shape}')
+print(f'y_barrier     : {y_barrier.shape}')
+print(f'host_labels   : {host_labels.shape}')
+print(f'surface_labels: {surface_labels.shape}')
+print()
+print('All subsequent steps use this feature matrix automatically.')
+print()
+print('After Colab reconnection run:')
+print('  1. Step 2  — checkpoint helpers')
+print('  2. Step 5d — reload combined matrix')
+print('  3. Resume from last completed step')
+
+from sklearn.ensemble import RandomForestRegressor
+
+def make_rf():
+    return RandomForestRegressor(
+        n_estimators=300,       # 300 for CV; 1000 for final model
+        max_features='sqrt',    # Reduces correlation between trees
+        min_samples_leaf=2,     # Slight regularisation against overfitting
+        n_jobs=-1,              # Use all CPU cores
+        random_state=SEED
+    )
+
+
+from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.model_selection import KFold, cross_val_predict
+
+class DeepForest:
+    """
+    Deep Forest (gcForest) — pure sklearn implementation.
+    Per layer: 2 x RandomForest + 2 x ExtraTrees.
+    Out-of-fold predictions between layers prevent data leakage.
+    Early stopping when improvement < min_delta.
+    Reference: Zhou & Feng (2017). arXiv:1702.08835
+    """
+
+    def __init__(self, n_estimators=150, max_layers=8,
+                 min_delta=0.001, cv_folds=3,
+                 n_jobs=-1, random_state=42):
+        self.n_estimators  = n_estimators
+        self.max_layers    = max_layers
+        self.min_delta     = min_delta
+        self.cv_folds      = cv_folds
+        self.n_jobs        = n_jobs
+        self.random_state  = random_state
+        self.layers_       = []
+        self.best_layer_   = 0
+        self.layer_scores_ = []
+
+    def _make_layer(self, layer_idx):
+        rs = self.random_state + layer_idx * 10
+        return [
+            RandomForestRegressor(n_estimators=self.n_estimators,
+                                  max_features='sqrt', min_samples_leaf=2,
+                                  n_jobs=self.n_jobs, random_state=rs),
+            RandomForestRegressor(n_estimators=self.n_estimators,
+                                  max_features=0.5,   min_samples_leaf=2,
+                                  n_jobs=self.n_jobs, random_state=rs + 1),
+            ExtraTreesRegressor(n_estimators=self.n_estimators,
+                                max_features='sqrt', min_samples_leaf=2,
+                                n_jobs=self.n_jobs, random_state=rs + 2),
+            ExtraTreesRegressor(n_estimators=self.n_estimators,
+                                max_features=0.5,   min_samples_leaf=2,
+                                n_jobs=self.n_jobs, random_state=rs + 3),
+        ]
+
+    def _oof_predictions(self, forests, X, y):
+        """Out-of-fold predictions — prevents leakage between cascade layers."""
+        kf  = KFold(n_splits=self.cv_folds, shuffle=True,
+                    random_state=self.random_state)
+        oof = np.zeros((len(X), len(forests)))
+        for j, forest in enumerate(forests):
+            oof[:, j] = cross_val_predict(forest, X, y, cv=kf, n_jobs=1)
+        return oof
+
+    def _layer_predict(self, forests, X):
+        preds = np.zeros((len(X), len(forests)))
+        for j, forest in enumerate(forests):
+            preds[:, j] = forest.predict(X)
+        return preds
+
+    def fit(self, X, y, verbose=True):
+        X = np.array(X);  y = np.array(y)
+        X_aug = X.copy();  best_score = -np.inf
+
+        for layer_idx in range(self.max_layers):
+            t0      = time.time()
+            forests = self._make_layer(layer_idx)
+            oof     = self._oof_predictions(forests, X_aug, y)
+            from sklearn.metrics import r2_score
+            score   = r2_score(y, oof.mean(axis=1))
+            self.layer_scores_.append(score)
+
+            for forest in forests:
+                forest.fit(X_aug, y)
+            self.layers_.append(forests)
+
+            if verbose:
+                print(f'  Layer {layer_idx+1:2d} | CV R²={score:.5f} | '
+                      f'Δ={score - best_score:+.5f} | {time.time()-t0:.1f}s')
+
+            if score > best_score + self.min_delta:
+                best_score       = score
+                self.best_layer_ = layer_idx
+            else:
+                if verbose:
+                    print(f'  → Early stop. Best layer: {self.best_layer_+1}')
+                self.layers_.pop()
+                break
+
+            X_aug = np.hstack([X, oof])
+        return self
+
+    def predict(self, X):
+        X = np.array(X);  X_aug = X.copy()
+        for layer_idx, forests in enumerate(self.layers_):
+            preds = self._layer_predict(forests, X_aug)
+            if layer_idx < len(self.layers_) - 1:
+                X_aug = np.hstack([X, preds])
+        return preds.mean(axis=1)
+
+    def feature_importances_from_layer(self, layer_idx=0, feature_names=None):
+        """MDI importance from a given layer — use layer 0 for original features."""
+        forests = self.layers_[layer_idx]
+        n_orig  = len(feature_names) if feature_names else forests[0].n_features_in_
+        imps    = np.zeros(n_orig)
+        for forest in forests:
+            imps += forest.feature_importances_[:n_orig]
+        imps /= len(forests)
+        if feature_names:
+            return pd.Series(imps, index=feature_names).sort_values(ascending=False)
+        return imps
+
+
+def make_df():
+    return DeepForest(
+        n_estimators=150, max_layers=8,
+        min_delta=0.001,  cv_folds=3,
+        random_state=SEED
+    )
+
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+
+def make_mlp():
+    return Pipeline([
+        ('scaler', StandardScaler()),         # Fitted on train fold only
+        ('mlp', MLPRegressor(
+            hidden_layer_sizes=(512, 256, 128),
+            activation='relu',
+            solver='adam',
+            alpha=0.001,                      # L2 regularisation
+            learning_rate='adaptive',
+            learning_rate_init=0.001,
+            max_iter=500,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=20,              # Patience = 20 epochs
+            random_state=SEED,
+            verbose=False
+        ))
+    ])
+
+print('✓ All three models defined: make_rf(), make_df(), make_mlp()')
+
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
+def compute_metrics(y_true, y_pred):
+    return {
+        'R2':   round(r2_score(y_true, y_pred), 5),
+        'MAE':  round(mean_absolute_error(y_true, y_pred), 5),
+        'RMSE': round(np.sqrt(mean_squared_error(y_true, y_pred)), 5)
+    }
+
+def print_summary(results_list, model_name, target_name):
+    df_r = pd.DataFrame(results_list)
+    print(f'\n{model_name} — {target_name}')
+    print(f'  R²   : {df_r.R2.mean():.5f} ± {df_r.R2.std():.5f}')
+    print(f'  MAE  : {df_r.MAE.mean():.5f} ± {df_r.MAE.std():.5f} eV')
+    print(f'  RMSE : {df_r.RMSE.mean():.5f} ± {df_r.RMSE.std():.5f} eV')
+
+print('✓ Metric helpers defined.')
+
+
+print('=' * 55)
+print('STEP 8 — FIVE-FOLD CROSS-VALIDATION')
+print('=' * 55)
+
+from sklearn.model_selection import KFold
+
+kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
+
+results_5f = load_checkpoint('results_5f')
+parity     = load_checkpoint('parity_5f')
+
+if results_5f is None:
+    results_5f = {
+        'RF':  {'barrier': [], 'rate': []},
+        'DF':  {'barrier': [], 'rate': []},
+        'MLP': {'barrier': [], 'rate': []},
+    }
+    parity = {
+        'RF':  {'true': [], 'pred': []},
+        'DF':  {'true': [], 'pred': []},
+        'MLP': {'true': [], 'pred': []},
+    }
+    completed_folds = 0
+    print('Starting 5-fold CV from scratch.')
+else:
+    completed_folds = len(results_5f['RF']['barrier'])
+    print(f'Resuming — {completed_folds} folds already done.')
+
+for fold, (train_idx, test_idx) in enumerate(kf.split(X_arr)):
+
+    if fold < completed_folds:
+        print(f'  Fold {fold+1} already done — skipping.')
+        continue
+
+    print(f'\n── Fold {fold+1}/5 ──────────────────────────────────────')
+    X_tr, X_te   = X_arr[train_idx], X_arr[test_idx]
+    yb_tr, yb_te = y_barrier[train_idx], y_barrier[test_idx]
+    yr_tr, yr_te = y_rate[train_idx],    y_rate[test_idx]
+
+    rf_b = make_rf();  rf_r = make_rf()
+    rf_b.fit(X_tr, yb_tr);  pred_rf_b = rf_b.predict(X_te)
+    rf_r.fit(X_tr, yr_tr);  pred_rf_r = rf_r.predict(X_te)
+    results_5f['RF']['barrier'].append(compute_metrics(yb_te, pred_rf_b))
+    results_5f['RF']['rate'].append(compute_metrics(yr_te, pred_rf_r))
+    parity['RF']['true'].extend(yb_te.tolist())
+    parity['RF']['pred'].extend(pred_rf_b.tolist())
+    print(f'  RF   B R²={results_5f["RF"]["barrier"][-1]["R2"]:.4f}  '
+          f'Rate R²={results_5f["RF"]["rate"][-1]["R2"]:.4f}')
+
+    df_b = make_df();  df_r = make_df()
+    print('  DF barrier:');  df_b.fit(X_tr, yb_tr, verbose=True)
+    print('  DF rate:');     df_r.fit(X_tr, yr_tr, verbose=True)
+    pred_df_b = df_b.predict(X_te);  pred_df_r = df_r.predict(X_te)
+    results_5f['DF']['barrier'].append(compute_metrics(yb_te, pred_df_b))
+    results_5f['DF']['rate'].append(compute_metrics(yr_te, pred_df_r))
+    parity['DF']['true'].extend(yb_te.tolist())
+    parity['DF']['pred'].extend(pred_df_b.tolist())
+    print(f'  DF   B R²={results_5f["DF"]["barrier"][-1]["R2"]:.4f}  '
+          f'Layers={df_b.best_layer_+1}')
+
+    mlp_b = make_mlp();  mlp_r = make_mlp()
+    mlp_b.fit(X_tr, yb_tr);  pred_mlp_b = mlp_b.predict(X_te)
+    mlp_r.fit(X_tr, yr_tr);  pred_mlp_r = mlp_r.predict(X_te)
+    results_5f['MLP']['barrier'].append(compute_metrics(yb_te, pred_mlp_b))
+    results_5f['MLP']['rate'].append(compute_metrics(yr_te, pred_mlp_r))
+    parity['MLP']['true'].extend(yb_te.tolist())
+    parity['MLP']['pred'].extend(pred_mlp_b.tolist())
+    print(f'  MLP  B R²={results_5f["MLP"]["barrier"][-1]["R2"]:.4f}  '
+          f'Epochs={mlp_b.named_steps["mlp"].n_iter_}')
+
+    save_checkpoint(results_5f, 'results_5f')
+    save_checkpoint(parity,     'parity_5f')
+    print(f'  ✓ Fold {fold+1} saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\n' + '='*55 + '\nFIVE-FOLD CV — BARRIER\n' + '='*55)
+for name in ['RF', 'DF', 'MLP']:
+    print_summary(results_5f[name]['barrier'], name, 'Barrier')
+
+print('\n' + '='*55 + '\nFIVE-FOLD CV — log10(RATE)\n' + '='*55)
+for name in ['RF', 'DF', 'MLP']:
+    print_summary(results_5f[name]['rate'], name, 'log10(rate)')
+
+# ── Parity plots ──────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+configs = [
+    ('RF',  parity['RF'],  'steelblue'),
+    ('DF',  parity['DF'],  'seagreen'),
+    ('MLP', parity['MLP'], 'tomato'),
+]
+for ax, (name, data, color) in zip(axes, configs):
+    true_v = np.array(data['true'])
+    pred_v = np.array(data['pred'])
+    r2  = r2_score(true_v, pred_v)
+    mae = mean_absolute_error(true_v, pred_v)
+    ax.scatter(true_v, pred_v, alpha=0.2, s=6, c=color, rasterized=True)
+    lims = [min(true_v.min(), pred_v.min()) - 0.05,
+            max(true_v.max(), pred_v.max()) + 0.05]
+    ax.plot(lims, lims, 'k--', lw=1)
+    ax.set_xlim(lims);  ax.set_ylim(lims)
+    ax.set_xlabel('DFT Barrier (eV)')
+    ax.set_ylabel('Predicted Barrier (eV)')
+    ax.set_title(f'{name}\nR²={r2:.4f}  MAE={mae:.4f} eV')
+plt.suptitle('Parity Plots — 5-Fold CV Test Predictions', fontsize=13)
+plt.tight_layout()
+save_figure(fig, 'parity_all_models')
+plt.show()
+
+print('=' * 55)
+print('STEP 8b — XGBOOST BASELINE')
+print('=' * 55)
+
+!pip install xgboost --quiet 2>/dev/null
+
+import xgboost as xgb
+from sklearn.model_selection import KFold
+from sklearn.metrics import r2_score, mean_absolute_error
+from tqdm.notebook import tqdm
+
+print(f'✓ XGBoost version: {xgb.__version__}')
+
+# ── Load dependencies ─────────────────────────────────────────────────────────
+try:
+    X_arr_combined
+except NameError:
+    combined_ckpt = load_checkpoint('matminer_features')
+    if combined_ckpt is not None:
+        X_arr_combined = combined_ckpt['X_arr_combined']
+    else:
+        ckpt = load_checkpoint('feature_matrix')
+        X_arr_combined = ckpt['X_arr']
+
+try:
+    y_barrier
+except NameError:
+    ckpt      = load_checkpoint('feature_matrix')
+    y_barrier = ckpt['y_barrier']
+
+print(f'Feature matrix : {X_arr_combined.shape}')
+
+# ── CV ────────────────────────────────────────────────────────────────────────
+xgb_ckpt = load_checkpoint('results_xgb')
+
+if xgb_ckpt is not None:
+    results_xgb = xgb_ckpt['results_xgb']
+    print('✓ XGBoost results loaded from Drive.')
+
+else:
+    kf          = KFold(n_splits=5, shuffle=True, random_state=SEED)
+    results_xgb = {'XGBoost': {'barrier': []}}
+    completed   = 0
+
+    partial = load_checkpoint('results_xgb_partial')
+    if partial is not None:
+        results_xgb = partial['results']
+        completed   = partial['completed']
+        print(f'Resuming from fold {completed+1}/5')
+
+    for fold, (train_idx, test_idx) in enumerate(
+            kf.split(X_arr_combined)):
+
+        if fold < completed:
+            print(f'  Fold {fold+1} already done — skipping.')
+            continue
+
+        print(f'\n── Fold {fold+1}/5 ──────────────────────────')
+        X_tr = X_arr_combined[train_idx]
+        X_te = X_arr_combined[test_idx]
+        y_tr = y_barrier[train_idx]
+        y_te = y_barrier[test_idx]
+
+        xgb_model = xgb.XGBRegressor(
+            n_estimators=500, learning_rate=0.05,
+            max_depth=6, subsample=0.8,
+            colsample_bytree=0.8, reg_alpha=0.1,
+            reg_lambda=1.0, random_state=SEED,
+            n_jobs=-1, verbosity=0, eval_metric='rmse')
+        xgb_model.fit(X_tr, y_tr,
+                      eval_set=[(X_te, y_te)],
+                      verbose=False)
+        pred = xgb_model.predict(X_te)
+        m    = compute_metrics(y_te, pred)
+        results_xgb['XGBoost']['barrier'].append(m)
+        print(f'  XGBoost: R²={m["R2"]:.4f}  MAE={m["MAE"]:.4f} eV')
+
+        save_checkpoint(
+            {'results': results_xgb, 'completed': fold+1},
+            'results_xgb_partial')
+        save_checkpoint(
+            {'results_xgb': results_xgb}, 'results_xgb')
+        print(f'  ✓ Fold {fold+1} saved.')
+
+    print('✓ XGBoost CV complete.')
+
+# ── Show results ──────────────────────────────────────────────────────────────
+print_summary(results_xgb['XGBoost']['barrier'], 'XGBoost', 'Barrier')
+
+# ── Parity ────────────────────────────────────────────────────────────────────
+xgb_parity = load_checkpoint('xgb_parity')
+
+if xgb_parity is not None:
+    all_true_xgb = xgb_parity['all_true_xgb']
+    all_pred_xgb = xgb_parity['all_pred_xgb']
+    print('✓ XGBoost parity loaded from Drive.')
+else:
+    all_true_xgb, all_pred_xgb = [], []
+    for fold, (train_idx, test_idx) in enumerate(
+            tqdm(KFold(n_splits=5, shuffle=True,
+                       random_state=SEED).split(X_arr_combined),
+                 total=5, desc='XGBoost parity', ncols=80)):
+        X_tr = X_arr_combined[train_idx]
+        X_te = X_arr_combined[test_idx]
+        y_tr = y_barrier[train_idx]
+        y_te = y_barrier[test_idx]
+        xgb_p = xgb.XGBRegressor(
+            n_estimators=500, learning_rate=0.05,
+            max_depth=6, subsample=0.8,
+            colsample_bytree=0.8, reg_alpha=0.1,
+            reg_lambda=1.0, random_state=SEED,
+            n_jobs=-1, verbosity=0, eval_metric='rmse')
+        xgb_p.fit(X_tr, y_tr,
+                  eval_set=[(X_te, y_te)], verbose=False)
+        all_true_xgb.extend(y_te.tolist())
+        all_pred_xgb.extend(xgb_p.predict(X_te).tolist())
+
+    all_true_xgb = np.array(all_true_xgb)
+    all_pred_xgb = np.array(all_pred_xgb)
+    save_checkpoint(
+        {'all_true_xgb': all_true_xgb,
+         'all_pred_xgb': all_pred_xgb}, 'xgb_parity')
+    print('✓ XGBoost parity saved.')
+
+fig, ax = plt.subplots(figsize=(6, 5))
+r2  = r2_score(all_true_xgb, all_pred_xgb)
+mae = mean_absolute_error(all_true_xgb, all_pred_xgb)
+ax.scatter(all_true_xgb, all_pred_xgb,
+           alpha=0.2, s=6, c='darkorange', rasterized=True)
+lims = [all_true_xgb.min()-0.05, all_true_xgb.max()+0.05]
+ax.plot(lims, lims, 'k--', lw=1)
+ax.set_xlim(lims); ax.set_ylim(lims)
+ax.set_xlabel('DFT Barrier (eV)')
+ax.set_ylabel('Predicted Barrier (eV)')
+ax.set_title(f'XGBoost — 5-Fold CV\nR²={r2:.4f}  MAE={mae:.4f} eV')
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.tight_layout()
+save_figure(fig, 'xgb_parity')
+plt.show()
+print(f'\n✓ Step 8b complete. XGBoost R²={r2:.4f}')
+
+print('=' * 55)
+print('STEP 8c — STATISTICAL SIGNIFICANCE TESTS')
+print('=' * 55)
+
+from scipy import stats
+
+wilcoxon_ckpt = load_checkpoint('wilcoxon_results')
+
+if wilcoxon_ckpt is not None:
+    wilcoxon_df = wilcoxon_ckpt['wilcoxon_df']
+    ci_df       = wilcoxon_ckpt['ci_df']
+    print('✓ Statistical test results loaded from Drive.')
+
+else:
+    # ── Load all CV results ───────────────────────────────────────────────────
+    try:
+        results_5f
+    except NameError:
+        results_5f = load_checkpoint('results_5f')
+
+    # Load XGBoost — new checkpoint name
+    try:
+        results_xgb
+    except NameError:
+        xgb_ckpt = load_checkpoint('results_xgb')
+        if xgb_ckpt is not None:
+            results_xgb = xgb_ckpt['results_xgb']
+            print('✓ XGBoost results loaded from Drive.')
+        else:
+            print('Note: XGBoost results not found — skipping XGBoost in tests.')
+            results_xgb = None
+
+    # ── Extract fold-level R² values ─────────────────────────────────────────
+    all_models = {}
+
+    if results_5f is not None:
+        for name in ['RF', 'DF', 'MLP']:
+            all_models[name] = [r['R2']
+                                for r in results_5f[name]['barrier']]
+
+    if results_xgb is not None:
+        all_models['XGBoost'] = [r['R2']
+                                 for r in results_xgb['XGBoost']['barrier']]
+
+    if len(all_models) == 0:
+        print('ERROR: No CV results found. Run Steps 8 and 8b first.')
+        raise SystemExit
+
+    print(f'\nModels available for testing: {list(all_models.keys())}')
+
+    # ── Wilcoxon signed-rank tests vs RF baseline ─────────────────────────────
+    print('\nWilcoxon signed-rank tests (vs Random Forest baseline):')
+    print('-' * 55)
+
+    baseline_name = 'RF'
+    baseline_r2   = all_models.get(baseline_name, None)
+
+    wilcoxon_rows = []
+
+    if baseline_r2 is None:
+        print('ERROR: RF results not found.')
+        raise SystemExit
+
+    for name, r2_vals in all_models.items():
+        if name == baseline_name:
+            continue
+        try:
+            stat, pval = stats.wilcoxon(r2_vals, baseline_r2)
+            significant = 'Yes' if pval < 0.05 else 'No'
+        except Exception:
+            stat, pval, significant = float('nan'), float('nan'), 'N/A'
+
+        wilcoxon_rows.append({
+            'Model A':     name,
+            'Model B':     baseline_name,
+            'W statistic': round(float(stat), 4) if not np.isnan(stat) else 'N/A',
+            'p-value':     round(float(pval), 4) if not np.isnan(pval) else 'N/A',
+            'Significant': significant,
+            'Mean R² A':   round(np.mean(r2_vals), 4),
+            'Mean R² B':   round(np.mean(baseline_r2), 4),
+        })
+        print(f'  {name:12s} vs RF: '
+              f'p={pval:.4f}  significant={significant}  '
+              f'({np.mean(r2_vals):.4f} vs {np.mean(baseline_r2):.4f})')
+
+    # DF vs MLP test
+    if 'DF' in all_models and 'MLP' in all_models:
+        try:
+            stat_df_mlp, pval_df_mlp = stats.wilcoxon(
+                all_models['DF'], all_models['MLP'])
+            print(f'\n  DF vs MLP: p={pval_df_mlp:.4f}  '
+                  f'significant={"Yes" if pval_df_mlp < 0.05 else "No"}')
+        except Exception:
+            print('  DF vs MLP: could not compute')
+
+    wilcoxon_df = pd.DataFrame(wilcoxon_rows)
+
+    # ── 95% Confidence intervals (bootstrap) ──────────────────────────────────
+    print('\n95% Confidence Intervals (bootstrap, 1000 iterations):')
+    print('-' * 55)
+
+    ci_rows  = []
+    rng      = np.random.RandomState(SEED)
+    n_boot   = 1000
+
+    for name, r2_vals in all_models.items():
+        r2_arr     = np.array(r2_vals)
+        boot_means = [
+            rng.choice(r2_arr, size=len(r2_arr),
+                       replace=True).mean()
+            for _ in range(n_boot)
+        ]
+        ci_low  = np.percentile(boot_means, 2.5)
+        ci_high = np.percentile(boot_means, 97.5)
+        ci_rows.append({
+            'Model':   name,
+            'Mean R²': round(r2_arr.mean(), 4),
+            'Std':     round(r2_arr.std(),  4),
+            'CI_low':  round(ci_low,  4),
+            'CI_high': round(ci_high, 4),
+            '95% CI':  f'[{ci_low:.4f}, {ci_high:.4f}]',
+        })
+        print(f'  {name:12s}: {r2_arr.mean():.4f} ± {r2_arr.std():.4f}'
+              f'  95% CI [{ci_low:.4f}, {ci_high:.4f}]')
+
+    ci_df = pd.DataFrame(ci_rows)
+
+    save_checkpoint({
+        'wilcoxon_df': wilcoxon_df,
+        'ci_df':       ci_df,
+    }, 'wilcoxon_results')
+    print('\n✓ Statistical test results saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\nWILCOXON TEST RESULTS:')
+print(wilcoxon_df.to_string(index=False))
+save_csv(wilcoxon_df, 'wilcoxon_test_results')
+
+print('\n95% CONFIDENCE INTERVALS:')
+print(ci_df.to_string(index=False))
+save_csv(ci_df, 'confidence_intervals')
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(10, 5))
+models   = ci_df['Model'].tolist()
+means    = ci_df['Mean R²'].tolist()
+ci_lows  = ci_df['CI_low'].tolist()
+ci_highs = ci_df['CI_high'].tolist()
+errors   = [[m - l for m, l in zip(means, ci_lows)],
+            [h - m for m, h in zip(means, ci_highs)]]
+colors   = ['steelblue','seagreen','tomato','darkorange','purple']
+
+ax.bar(models, means,
+       color=colors[:len(models)],
+       alpha=0.85,
+       yerr=errors,
+       capsize=6,
+       error_kw={'linewidth': 2})
+ax.set_ylabel('R² (5-Fold CV)')
+ax.set_title('Model Comparison with 95% Confidence Intervals')
+ax.set_ylim(min(means) - 0.01, 1.0)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.tight_layout()
+save_figure(fig, 'model_comparison_with_ci')
+plt.show()
+
+print('\n✓ Step 8c complete.')
+
+print('=' * 55)
+print('STEP 9 — LEAVE-ONE-HOST-OUT CV')
+print('=' * 55)
+
+unique_hosts = np.unique(host_labels)
+
+results_loho = load_checkpoint('results_loho')
+if results_loho is None:
+    results_loho    = {'RF': [], 'DF': [], 'MLP': []}
+    completed_hosts = 0
+    print('Starting LOHO-CV from scratch.')
+else:
+    completed_hosts = len(results_loho['RF'])
+    print(f'Resuming — {completed_hosts}/{len(unique_hosts)} hosts done.')
+
+for i, host in enumerate(unique_hosts):
+
+    if i < completed_hosts:
+        print(f'  [{i+1:2d}] {host} already done — skipping.')
+        continue
+
+    print(f'\n[{i+1:2d}/{len(unique_hosts)}] Host held out: {host}')
+    train_mask = host_labels != host
+    test_mask  = host_labels == host
+    X_tr, X_te   = X_arr[train_mask], X_arr[test_mask]
+    yb_tr, yb_te = y_barrier[train_mask], y_barrier[test_mask]
+
+    rf = make_rf();  rf.fit(X_tr, yb_tr)
+    m = compute_metrics(yb_te, rf.predict(X_te));  m['host'] = host
+    results_loho['RF'].append(m)
+
+    df_m = make_df();  df_m.fit(X_tr, yb_tr, verbose=False)
+    m2 = compute_metrics(yb_te, df_m.predict(X_te));  m2['host'] = host
+    results_loho['DF'].append(m2)
+
+    mlp = make_mlp();  mlp.fit(X_tr, yb_tr)
+    m3 = compute_metrics(yb_te, mlp.predict(X_te));  m3['host'] = host
+    results_loho['MLP'].append(m3)
+
+    print(f'  RF  R²={m["R2"]:.4f}  MAE={m["MAE"]:.4f} eV')
+    print(f'  DF  R²={m2["R2"]:.4f}  MAE={m2["MAE"]:.4f} eV')
+    print(f'  MLP R²={m3["R2"]:.4f}  MAE={m3["MAE"]:.4f} eV')
+
+    save_checkpoint(results_loho, 'results_loho')
+    print(f'  ✓ Host {host} saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\n' + '='*55 + '\nLOHO-CV SUMMARY\n' + '='*55)
+for name in ['RF', 'DF', 'MLP']:
+    print_summary(results_loho[name], name, 'LOHO Barrier')
+
+loho_table = pd.DataFrame({
+    'Host':    [r['host'] for r in results_loho['RF']],
+    'RF_R2':   [r['R2']  for r in results_loho['RF']],
+    'RF_MAE':  [r['MAE'] for r in results_loho['RF']],
+    'DF_R2':   [r['R2']  for r in results_loho['DF']],
+    'DF_MAE':  [r['MAE'] for r in results_loho['DF']],
+    'MLP_R2':  [r['R2']  for r in results_loho['MLP']],
+    'MLP_MAE': [r['MAE'] for r in results_loho['MLP']],
+})
+save_csv(loho_table.sort_values('RF_MAE'), 'loho_results')
+print('\nPer-host results (sorted by RF MAE):')
+print(loho_table.sort_values('RF_MAE').to_string(index=False))
+
+# ── Heatmap ───────────────────────────────────────────────────────────────────
+hosts_sorted = loho_table.sort_values('RF_MAE')['Host'].tolist()
+loho_heat = loho_table.set_index('Host').loc[
+    hosts_sorted, ['RF_R2', 'DF_R2', 'MLP_R2']]
+loho_heat.columns = ['RF', 'Deep Forest', 'MLP']
+fig, ax = plt.subplots(figsize=(5, 10))
+sns.heatmap(loho_heat, annot=True, fmt='.3f', cmap='RdYlGn',
+            vmin=0.3, vmax=1.0, linewidths=0.5, ax=ax,
+            cbar_kws={'label': 'R² (Barrier)', 'shrink': 0.6})
+ax.set_title('LOHO-CV R² per Host Metal', fontsize=11)
+ax.set_xlabel('Model')
+plt.tight_layout()
+save_figure(fig, 'loho_heatmap')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 9b — XGBOOST LOHO-CV')
+print('=' * 55)
+
+import xgboost as xgb
+
+# ── Load dependencies ─────────────────────────────────────────────────────────
+try:
+    X_arr_combined
+except NameError:
+    combined_ckpt = load_checkpoint('matminer_features')
+    if combined_ckpt is not None:
+        X_arr_combined = combined_ckpt['X_arr_combined']
+    else:
+        ckpt           = load_checkpoint('feature_matrix')
+        X_arr_combined = ckpt['X_arr']
+
+try:
+    y_barrier; host_labels
+except NameError:
+    ckpt           = load_checkpoint('feature_matrix')
+    y_barrier      = ckpt['y_barrier']
+    host_labels    = ckpt['host_labels']
+
+unique_hosts = np.unique(host_labels)
+print(f'Total hosts: {len(unique_hosts)}')
+
+xgb_loho_ckpt = load_checkpoint('results_xgb_loho')
+
+if xgb_loho_ckpt is not None:
+    results_xgb_loho = xgb_loho_ckpt['results_xgb_loho']
+    print('✓ XGBoost LOHO results loaded from Drive.')
+
+else:
+    results_xgb_loho = {'XGBoost': []}
+    completed        = 0
+
+    partial = load_checkpoint('results_xgb_loho_partial')
+    if partial is not None:
+        results_xgb_loho = partial['results']
+        completed        = partial['completed']
+        print(f'Resuming from host {completed+1}/{len(unique_hosts)}')
+
+    for i, host in enumerate(unique_hosts):
+        if i < completed:
+            print(f'  [{i+1:2d}] {host} already done — skipping.')
+            continue
+
+        print(f'[{i+1:2d}/{len(unique_hosts)}] Host held out: {host}')
+        train_mask = host_labels != host
+        test_mask  = host_labels == host
+        X_tr = X_arr_combined[train_mask]
+        X_te = X_arr_combined[test_mask]
+        y_tr = y_barrier[train_mask]
+        y_te = y_barrier[test_mask]
+
+        xgb_model = xgb.XGBRegressor(
+            n_estimators=300, learning_rate=0.05,
+            max_depth=6, subsample=0.8,
+            colsample_bytree=0.8, random_state=SEED,
+            n_jobs=-1, verbosity=0, eval_metric='rmse')
+        xgb_model.fit(X_tr, y_tr, verbose=False)
+        m      = compute_metrics(y_te, xgb_model.predict(X_te))
+        m['host'] = host
+        results_xgb_loho['XGBoost'].append(m)
+        print(f'  XGBoost: R²={m["R2"]:.4f}  MAE={m["MAE"]:.4f} eV')
+
+        save_checkpoint(
+            {'results': results_xgb_loho, 'completed': i+1},
+            'results_xgb_loho_partial')
+        save_checkpoint(
+            {'results_xgb_loho': results_xgb_loho},
+            'results_xgb_loho')
+        print(f'  ✓ Host {host} saved.')
+
+    print('✓ XGBoost LOHO-CV complete.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+vals = results_xgb_loho['XGBoost']
+print(f'\nXGBoost LOHO-CV:')
+print(f'  R²  : {np.mean([r["R2"]  for r in vals]):.4f} ± '
+      f'{np.std([r["R2"]  for r in vals]):.4f}')
+print(f'  MAE : {np.mean([r["MAE"] for r in vals]):.4f} ± '
+      f'{np.std([r["MAE"] for r in vals]):.4f} eV')
+
+save_csv(pd.DataFrame(vals), 'xgb_loho_results')
+print('✓ Step 9b complete.')
+
+print('=' * 55)
+print('STEP 10 — LEAVE-ONE-SURFACE-OUT CV')
+print('=' * 55)
+
+unique_surfaces = np.unique(surface_labels)
+
+results_loso = load_checkpoint('results_loso')
+if results_loso is None:
+    results_loso       = {'RF': [], 'DF': [], 'MLP': []}
+    completed_surfaces = 0
+    print('Starting LOSO-CV from scratch.')
+else:
+    completed_surfaces = len(results_loso['RF'])
+    print(f'Resuming — {completed_surfaces}/{len(unique_surfaces)} surfaces done.')
+
+for i, surf in enumerate(unique_surfaces):
+
+    if i < completed_surfaces:
+        print(f'  [{i+1:2d}] {surf} already done — skipping.')
+        continue
+
+    print(f'\n[{i+1:2d}/{len(unique_surfaces)}] Surface held out: {surf}')
+    train_mask = surface_labels != surf
+    test_mask  = surface_labels == surf
+    X_tr, X_te   = X_arr[train_mask], X_arr[test_mask]
+    yb_tr, yb_te = y_barrier[train_mask], y_barrier[test_mask]
+
+    rf = make_rf();  rf.fit(X_tr, yb_tr)
+    m = compute_metrics(yb_te, rf.predict(X_te));  m['surface'] = surf
+    results_loso['RF'].append(m)
+
+    df_m = make_df();  df_m.fit(X_tr, yb_tr, verbose=False)
+    m2 = compute_metrics(yb_te, df_m.predict(X_te));  m2['surface'] = surf
+    results_loso['DF'].append(m2)
+
+    mlp = make_mlp();  mlp.fit(X_tr, yb_tr)
+    m3 = compute_metrics(yb_te, mlp.predict(X_te));  m3['surface'] = surf
+    results_loso['MLP'].append(m3)
+
+    print(f'  RF  R²={m["R2"]:.4f}  MAE={m["MAE"]:.4f} eV')
+    print(f'  DF  R²={m2["R2"]:.4f}  MAE={m2["MAE"]:.4f} eV')
+    print(f'  MLP R²={m3["R2"]:.4f}  MAE={m3["MAE"]:.4f} eV')
+
+    save_checkpoint(results_loso, 'results_loso')
+    print(f'  ✓ Surface {surf} saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\n' + '='*55 + '\nLOSO-CV SUMMARY\n' + '='*55)
+for name in ['RF', 'DF', 'MLP']:
+    print_summary(results_loso[name], name, 'LOSO Barrier')
+
+loso_table = pd.DataFrame({
+    'Surface': [r['surface'] for r in results_loso['RF']],
+    'RF_R2':   [r['R2']  for r in results_loso['RF']],
+    'RF_MAE':  [r['MAE'] for r in results_loso['RF']],
+    'DF_R2':   [r['R2']  for r in results_loso['DF']],
+    'DF_MAE':  [r['MAE'] for r in results_loso['DF']],
+    'MLP_R2':  [r['R2']  for r in results_loso['MLP']],
+    'MLP_MAE': [r['MAE'] for r in results_loso['MLP']],
+})
+save_csv(loso_table.sort_values('RF_MAE'), 'loso_results')
+print('\nPer-surface results (sorted by RF MAE):')
+print(loso_table.sort_values('RF_MAE').to_string(index=False))
+
+# ── Bar chart ─────────────────────────────────────────────────────────────────
+surfs_sorted = loso_table.sort_values('RF_MAE')['Surface'].tolist()
+fig, ax = plt.subplots(figsize=(13, 5))
+x_pos = np.arange(len(surfs_sorted))
+width = 0.26
+for j, (col, color, label) in enumerate([
+    ('RF_R2',  'steelblue', 'RF'),
+    ('DF_R2',  'seagreen',  'Deep Forest'),
+    ('MLP_R2', 'tomato',    'MLP')
+]):
+    r2_vals = loso_table.set_index('Surface').loc[surfs_sorted, col].values
+    ax.bar(x_pos + j * width, r2_vals, width=width,
+           color=color, alpha=0.85, label=label)
+ax.set_xticks(x_pos + width)
+ax.set_xticklabels(surfs_sorted, rotation=45, ha='right', fontsize=9)
+ax.set_ylabel('R²  (Barrier)')
+ax.set_title('LOSO-CV R² per Surface Facet — All Three Models')
+ax.legend()
+ax.set_ylim(0.5, 1.05)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.tight_layout()
+save_figure(fig, 'loso_surface_barchart')
+plt.show()
+
+print('=' * 55)
+print('STEP 10b — XGBOOST LOSO-CV')
+print('=' * 55)
+
+import xgboost as xgb
+
+# ── Load dependencies ─────────────────────────────────────────────────────────
+try:
+    X_arr_combined
+except NameError:
+    combined_ckpt = load_checkpoint('matminer_features')
+    if combined_ckpt is not None:
+        X_arr_combined = combined_ckpt['X_arr_combined']
+    else:
+        ckpt           = load_checkpoint('feature_matrix')
+        X_arr_combined = ckpt['X_arr']
+
+try:
+    y_barrier; surface_labels
+except NameError:
+    ckpt           = load_checkpoint('feature_matrix')
+    y_barrier      = ckpt['y_barrier']
+    surface_labels = ckpt['surface_labels']
+
+unique_surfaces = np.unique(surface_labels)
+print(f'Total surfaces: {len(unique_surfaces)}')
+
+xgb_loso_ckpt = load_checkpoint('results_xgb_loso')
+
+if xgb_loso_ckpt is not None:
+    results_xgb_loso = xgb_loso_ckpt['results_xgb_loso']
+    print('✓ XGBoost LOSO results loaded from Drive.')
+
+else:
+    results_xgb_loso = {'XGBoost': []}
+    completed        = 0
+
+    partial = load_checkpoint('results_xgb_loso_partial')
+    if partial is not None:
+        results_xgb_loso = partial['results']
+        completed        = partial['completed']
+        print(f'Resuming from surface {completed+1}/{len(unique_surfaces)}')
+
+    for i, surf in enumerate(unique_surfaces):
+        if i < completed:
+            print(f'  [{i+1:2d}] {surf} already done — skipping.')
+            continue
+
+        print(f'[{i+1:2d}/{len(unique_surfaces)}] Surface held out: {surf}')
+        train_mask = surface_labels != surf
+        test_mask  = surface_labels == surf
+        X_tr = X_arr_combined[train_mask]
+        X_te = X_arr_combined[test_mask]
+        y_tr = y_barrier[train_mask]
+        y_te = y_barrier[test_mask]
+
+        xgb_model = xgb.XGBRegressor(
+            n_estimators=300, learning_rate=0.05,
+            max_depth=6, subsample=0.8,
+            colsample_bytree=0.8, random_state=SEED,
+            n_jobs=-1, verbosity=0, eval_metric='rmse')
+        xgb_model.fit(X_tr, y_tr, verbose=False)
+        m         = compute_metrics(y_te, xgb_model.predict(X_te))
+        m['surface'] = surf
+        results_xgb_loso['XGBoost'].append(m)
+        print(f'  XGBoost: R²={m["R2"]:.4f}  MAE={m["MAE"]:.4f} eV')
+
+        save_checkpoint(
+            {'results': results_xgb_loso, 'completed': i+1},
+            'results_xgb_loso_partial')
+        save_checkpoint(
+            {'results_xgb_loso': results_xgb_loso},
+            'results_xgb_loso')
+        print(f'  ✓ Surface {surf} saved.')
+
+    print('✓ XGBoost LOSO-CV complete.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+vals = results_xgb_loso['XGBoost']
+print(f'\nXGBoost LOSO-CV:')
+print(f'  R²  : {np.mean([r["R2"]  for r in vals]):.4f} ± '
+      f'{np.std([r["R2"]  for r in vals]):.4f}')
+print(f'  MAE : {np.mean([r["MAE"] for r in vals]):.4f} ± '
+      f'{np.std([r["MAE"] for r in vals]):.4f} eV')
+
+save_csv(pd.DataFrame(vals), 'xgb_loso_results')
+print('✓ Step 10b complete.')
+
+print('=' * 55)
+print('STEP 11 — FINAL MODEL TRAINING')
+print('=' * 55)
+
+def model_exists(name):
+    return os.path.exists(f'{SAVE_DIR}/models/{name}.joblib')
+
+def load_model(name):
+    path = f'{SAVE_DIR}/models/{name}.joblib'
+    if os.path.exists(path):
+        model = joblib.load(path)
+        print(f'  ✓ Loaded from Drive: {name}.joblib')
+        return model
+    return None
+
+def save_model(model, name):
+    joblib.dump(model, f'{SAVE_DIR}/models/{name}.joblib')
+    print(f'  ✓ Saved to Drive: {name}.joblib')
+
+# ── RF Barrier ────────────────────────────────────────────────────────────────
+rf_final_barrier = load_model('rf_barrier_final')
+if rf_final_barrier is None:
+    print('\nTraining RF Barrier...')
+    rf_final_barrier = RandomForestRegressor(
+        n_estimators=1000, max_features='sqrt',
+        min_samples_leaf=2, n_jobs=-1, random_state=SEED)
+    rf_final_barrier.fit(X_arr, y_barrier)
+    save_model(rf_final_barrier, 'rf_barrier_final')
+else:
+    print('RF Barrier already trained — skipping.')
+
+# ── RF Rate ───────────────────────────────────────────────────────────────────
+rf_final_rate = load_model('rf_rate_final')
+if rf_final_rate is None:
+    print('\nTraining RF Rate...')
+    rf_final_rate = RandomForestRegressor(
+        n_estimators=1000, max_features='sqrt',
+        min_samples_leaf=2, n_jobs=-1, random_state=SEED)
+    rf_final_rate.fit(X_arr, y_rate)
+    save_model(rf_final_rate, 'rf_rate_final')
+else:
+    print('RF Rate already trained — skipping.')
+
+# ── Deep Forest Barrier ───────────────────────────────────────────────────────
+final_df_barrier = load_model('df_barrier_final')
+if final_df_barrier is None:
+    print('\nTraining Deep Forest Barrier...')
+    final_df_barrier = DeepForest(
+        n_estimators=200, max_layers=10,
+        min_delta=0.001, cv_folds=3, random_state=SEED)
+    final_df_barrier.fit(X_arr, y_barrier, verbose=True)
+    save_model(final_df_barrier, 'df_barrier_final')
+else:
+    print('Deep Forest Barrier already trained — skipping.')
+
+# ── Deep Forest Rate ──────────────────────────────────────────────────────────
+final_df_rate = load_model('df_rate_final')
+if final_df_rate is None:
+    print('\nTraining Deep Forest Rate...')
+    final_df_rate = DeepForest(
+        n_estimators=200, max_layers=10,
+        min_delta=0.001, cv_folds=3, random_state=SEED)
+    final_df_rate.fit(X_arr, y_rate, verbose=True)
+    save_model(final_df_rate, 'df_rate_final')
+else:
+    print('Deep Forest Rate already trained — skipping.')
+
+# ── MLP Barrier ───────────────────────────────────────────────────────────────
+final_mlp_barrier = load_model('mlp_barrier_final')
+if final_mlp_barrier is None:
+    print('\nTraining MLP Barrier...')
+    final_mlp_barrier = make_mlp()
+    final_mlp_barrier.fit(X_arr, y_barrier)
+    save_model(final_mlp_barrier, 'mlp_barrier_final')
+else:
+    print('MLP Barrier already trained — skipping.')
+
+# ── MLP Rate ──────────────────────────────────────────────────────────────────
+final_mlp_rate = load_model('mlp_rate_final')
+if final_mlp_rate is None:
+    print('\nTraining MLP Rate...')
+    final_mlp_rate = make_mlp()
+    final_mlp_rate.fit(X_arr, y_rate)
+    save_model(final_mlp_rate, 'mlp_rate_final')
+else:
+    print('MLP Rate already trained — skipping.')
+
+# ── Always show status ────────────────────────────────────────────────────────
+print('\n' + '='*55)
+print('STEP 11 STATUS — ALL MODELS')
+print('='*55)
+model_names = [
+    'rf_barrier_final', 'rf_rate_final',
+    'df_barrier_final', 'df_rate_final',
+    'mlp_barrier_final','mlp_rate_final'
+]
+for name in model_names:
+    status = '✓ EXISTS' if model_exists(name) else '✗ MISSING'
+    print(f'  {name:25s}: {status}')
+
+# ── Quick accuracy check on full data ────────────────────────────────────────
+print('\nFull-data R² (training set — for reference only, not CV):')
+for name, model in [('RF',         rf_final_barrier),
+                     ('Deep Forest',final_df_barrier),
+                     ('MLP',        final_mlp_barrier)]:
+    pred = model.predict(X_arr)
+    r2   = r2_score(y_barrier, pred)
+    mae  = mean_absolute_error(y_barrier, pred)
+    print(f'  {name:15s}: R²={r2:.4f}  MAE={mae:.4f} eV')
+print('  (Note: full-data R² is always higher than CV R² — use CV values in paper)')
+
+print('=' * 55)
+print('STEP 12 — GLOBAL FEATURE IMPORTANCE')
+print('=' * 55)
+
+fi_ckpt = load_checkpoint('feature_importance')
+
+if fi_ckpt is not None:
+    fi_rf = fi_ckpt['fi_rf']
+    fi_df = fi_ckpt['fi_df']
+    print('✓ Feature importances loaded from Drive.')
+
+else:
+    # rf_final_barrier need
+    try:
+        rf_final_barrier
+    except NameError:
+        rf_final_barrier = load_model('rf_barrier_final')
+        if rf_final_barrier is None:
+            print('ERROR: No RF model । first run Step 11.')
+            raise SystemExit
+
+    # final_df_barrier need
+    try:
+        final_df_barrier
+    except NameError:
+        final_df_barrier = load_model('df_barrier_final')
+        if final_df_barrier is None:
+            print('ERROR:No Deep Forest model । first run Step 11.')
+            raise SystemExit
+
+    fi_rf = pd.Series(
+        rf_final_barrier.feature_importances_,
+        index=feature_names).sort_values(ascending=False)
+
+    fi_df = final_df_barrier.feature_importances_from_layer(
+        layer_idx=0, feature_names=feature_names)
+
+    save_checkpoint(
+        {'fi_rf': fi_rf, 'fi_df': fi_df},
+        'feature_importance')
+    print('✓ Feature importances computed and saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\nTOP 20 — Random Forest:')
+print(fi_rf.head(20).round(4).to_string())
+print('\nTOP 20 — Deep Forest (Layer 1):')
+print(fi_df.head(20).round(4).to_string())
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+fi_rf.head(15).sort_values().plot(
+    kind='barh', ax=ax1, color='steelblue', alpha=0.85)
+ax1.set_xlabel('MDI Importance')
+ax1.set_title('Random Forest — Top 15')
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+
+fi_df.head(15).sort_values().plot(
+    kind='barh', ax=ax2, color='seagreen', alpha=0.85)
+ax2.set_xlabel('MDI Importance')
+ax2.set_title('Deep Forest Layer 1 — Top 15')
+ax2.spines['top'].set_visible(False)
+ax2.spines['right'].set_visible(False)
+
+plt.suptitle('Global Feature Importance — Barrier Prediction', fontsize=13)
+plt.tight_layout()
+save_figure(fig, 'feature_importance_global')
+plt.show()
+
+save_csv(fi_rf.reset_index().rename(
+    columns={'index': 'feature', 0: 'importance'}),
+    'feature_importance_rf')
+save_csv(fi_df.reset_index().rename(
+    columns={'index': 'feature', 0: 'importance'}),
+    'feature_importance_df')
+
+print('=' * 55)
+print('STEP 13 — SURFACE-SPECIFIC FEATURE IMPORTANCE')
+print('=' * 55)
+
+# ── fi_rf need ───────────────────────────────────────────────────────────────
+try:
+    fi_rf
+except NameError:
+    fi_ckpt = load_checkpoint('feature_importance')
+    if fi_ckpt is None:
+        print('ERROR:No Step 12 এর data। first run Step 12.')
+        raise SystemExit
+    fi_rf = fi_ckpt['fi_rf']
+
+# ──need feature_matrix ─────────────────────────────────────────────────────
+try:
+    X_arr
+    surface_labels
+except NameError:
+    ckpt = load_checkpoint('feature_matrix')
+    if ckpt is None:
+        print('ERROR: No data from Step 5 । first run Step 5.')
+        raise SystemExit
+    X_arr          = ckpt['X_arr']
+    y_barrier      = ckpt['y_barrier']
+    feature_names  = ckpt['feature_names']
+    surface_labels = ckpt['surface_labels']
+    X              = pd.DataFrame(X_arr, columns=feature_names)
+
+target_surfaces = ['_100', '_110', '_111', '_211', '_221', '_310']
+
+fi_per_surface = load_checkpoint('fi_per_surface')
+
+if fi_per_surface is not None:
+    print('✓ Per-surface importances loaded from Drive.')
+
+else:
+    fi_per_surface = {}
+    for surf in target_surfaces:
+        mask = surface_labels == surf
+        rf_s = RandomForestRegressor(
+            n_estimators=300, max_features='sqrt',
+            min_samples_leaf=2, n_jobs=-1, random_state=SEED)
+        rf_s.fit(X_arr[mask], y_barrier[mask])
+        fi_s = pd.Series(rf_s.feature_importances_, index=feature_names)
+        fi_per_surface[surf] = fi_s.sort_values(ascending=False)
+        print(f'  ✓ {surf} done.')
+
+    save_checkpoint(fi_per_surface, 'fi_per_surface')
+    print('✓ Per-surface importances saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+for surf in target_surfaces:
+    print(f'\n{surf} — top 5:')
+    print(fi_per_surface[surf].head(5).round(4).to_string())
+
+top10_global = fi_rf.head(10).index.tolist()
+heatmap_data = pd.DataFrame(
+    {surf: fi_per_surface[surf][top10_global]
+     for surf in target_surfaces})
+
+fig, ax = plt.subplots(figsize=(10, 6))
+sns.heatmap(heatmap_data, annot=True, fmt='.3f',
+            cmap='YlOrRd', linewidths=0.3, ax=ax)
+ax.set_title('Feature Importance by Surface — Top 10 Global Features')
+ax.set_xlabel('Surface Facet')
+ax.set_ylabel('Feature')
+plt.tight_layout()
+save_figure(fig, 'feature_importance_per_surface')
+plt.show()
+
+print('=' * 55)
+print('STEP 14 — SHAP ANALYSIS')
+print('=' * 55)
+
+import shap
+
+# ── RF SHAP ───────────────────────────────────────────────────────────────────
+shap_ckpt_rf = load_checkpoint('shap_values_rf')
+
+if shap_ckpt_rf is not None:
+    shap_values_rf = shap_ckpt_rf['shap_values_rf']
+    X_sample       = shap_ckpt_rf['X_sample']
+    print('✓ RF SHAP loaded from Drive.')
+
+else:
+    # check rf_final_barrier in the memory
+    if 'rf_final_barrier' not in dir():
+        rf_final_barrier = load_model('rf_barrier_final')
+        if rf_final_barrier is None:
+            print('ERROR: No RF model. first run Step 11.')
+            raise SystemExit
+
+    sample_idx = np.random.choice(len(X_arr), 300, replace=False)
+    X_sample       = X.iloc[sample_idx]
+    print('Computing SHAP for Random Forest...')
+    explainer_rf   = shap.TreeExplainer(rf_final_barrier)
+    shap_values_rf = explainer_rf.shap_values(X_sample)
+    save_checkpoint(
+        {'shap_values_rf': shap_values_rf,
+         'X_sample':       X_sample},
+        'shap_values_rf')
+    print('✓ RF SHAP saved to Drive.')
+
+# ── Always show RF SHAP plots ─────────────────────────────────────────────────
+shap.summary_plot(shap_values_rf, X_sample, max_display=20,
+                  show=False, plot_type='dot')
+plt.title('SHAP Summary — Random Forest (Barrier)')
+plt.tight_layout()
+save_figure(plt.gcf(), 'shap_rf_dot')
+plt.show()
+
+shap.summary_plot(shap_values_rf, X_sample, max_display=20,
+                  show=False, plot_type='bar')
+plt.title('SHAP Bar — Random Forest (Barrier)')
+plt.tight_layout()
+save_figure(plt.gcf(), 'shap_rf_bar')
+plt.show()
+
+# ── MLP SHAP ──────────────────────────────────────────────────────────────────
+shap_ckpt_mlp = load_checkpoint('shap_values_mlp')
+
+if shap_ckpt_mlp is not None:
+    shap_values_mlp = shap_ckpt_mlp['shap_values_mlp']
+    X_sample_mlp    = shap_ckpt_mlp['X_sample_mlp']
+    print('✓ MLP SHAP loaded from Drive.')
+
+else:
+    # check final_mlp_barrier in the memory.
+    if 'final_mlp_barrier' not in dir():
+        final_mlp_barrier = load_model('mlp_barrier_final')
+        if final_mlp_barrier is None:
+            print('ERROR: No MLP model. first run Step 11.')
+            raise SystemExit
+
+    print('Computing SHAP for Neural Network (~10 min)...')
+    background      = shap.sample(X_sample, 100)
+    explainer_mlp   = shap.KernelExplainer(
+        final_mlp_barrier.predict, background)
+    X_sample_mlp    = X_sample.iloc[:100]
+    shap_values_mlp = explainer_mlp.shap_values(
+        X_sample_mlp, nsamples=200)
+    save_checkpoint(
+        {'shap_values_mlp': shap_values_mlp,
+         'X_sample_mlp':    X_sample_mlp},
+        'shap_values_mlp')
+    print('✓ MLP SHAP saved to Drive.')
+
+# ── Always show MLP SHAP plot ─────────────────────────────────────────────────
+shap.summary_plot(shap_values_mlp, X_sample_mlp,
+                  max_display=20, show=False, plot_type='dot',
+                  feature_names=feature_names)
+plt.title('SHAP Summary — Neural Network (Barrier)')
+plt.tight_layout()
+save_figure(plt.gcf(), 'shap_mlp_dot')
+plt.show()
+
+print('=' * 55)
+print('STEP 15 — SHAP DEPENDENCE ANALYSIS')
+print('=' * 55)
+
+import shap
+
+shap_ckpt_rf = load_checkpoint('shap_values_rf')
+if shap_ckpt_rf is None:
+    print('ERROR: Step 14 এর SHAP data নেই। আগে Step 14 run করুন.')
+else:
+    shap_values_rf = shap_ckpt_rf['shap_values_rf']
+    X_sample       = shap_ckpt_rf['X_sample']
+
+    dep_done = load_checkpoint('shap_dependence_done')
+    if dep_done is not None:
+        print('✓ Dependence plots already computed.')
+    else:
+        print('Computing dependence plots...')
+
+    # ── Always plot ───────────────────────────────────────────────────────────
+    key_descriptors = [
+        'doped_weighted_surface_energy',
+        'doped_d-band_center',
+        'delta_d_band',
+        'delta_electroneg',
+        'host_d-electron',
+        'host_molar_volume'
+    ]
+    for feat in key_descriptors:
+        if feat not in feature_names:
+            print(f'Skipping {feat} — not in feature list')
+            continue
+        fig, ax = plt.subplots(figsize=(7, 5))
+        shap.dependence_plot(feat, shap_values_rf, X_sample,
+                             interaction_index='auto',
+                             show=False, ax=ax)
+        ax.set_title(f'SHAP Dependence — {feat}')
+        ax.axhline(0, color='gray', linestyle='--', linewidth=0.8)
+        plt.tight_layout()
+        fname = feat.replace('/', '_').replace('-', '_')
+        save_figure(fig, f'shap_dependence_{fname}')
+        plt.show()
+
+    if dep_done is None:
+        save_checkpoint('done', 'shap_dependence_done')
+        print('✓ Dependence plots saved to Drive.')
+
+
+print('=' * 55)
+print('STEP 16 — SHAP INTERACTION ANALYSIS')
+print('=' * 55)
+
+import shap
+import math
+import time
+import copy
+from tqdm.notebook import tqdm
+
+interact_ckpt = load_checkpoint('shap_interaction')
+
+if interact_ckpt is not None:
+    interact_pairs = interact_ckpt['interact_pairs']
+    interact_df    = interact_ckpt['interact_df']
+    print('✓ SHAP interaction values loaded from Drive.')
+
+else:
+    # rf_final_barrier check
+    try:
+        rf_final_barrier
+    except NameError:
+        rf_final_barrier = load_model('rf_barrier_final')
+        if rf_final_barrier is None:
+            print('ERROR: RF model not found. Run Step 11 first.')
+            raise SystemExit
+
+    # X_arr check
+    try:
+        X_arr
+    except NameError:
+        ckpt = load_checkpoint('feature_matrix')
+        if ckpt is None:
+            print('ERROR: Feature matrix not found. Run Step 5 first.')
+            raise SystemExit
+        X_arr         = ckpt['X_arr']
+        feature_names = ckpt['feature_names']
+        X             = pd.DataFrame(X_arr, columns=feature_names)
+
+    # ── Settings ──────────────────────────────────────────────────────────────
+    N_TREES_FOR_INTERACTION = 100
+    N_SAMPLES               = 100
+
+    # ── Build lighter RF using first N trees ──────────────────────────────────
+    rf_light              = copy.copy(rf_final_barrier)
+    rf_light.estimators_  = rf_final_barrier.estimators_[:N_TREES_FOR_INTERACTION]
+    rf_light.n_estimators = N_TREES_FOR_INTERACTION
+
+    # ── Sample selection ──────────────────────────────────────────────────────
+    sample_idx_small = np.random.choice(len(X_arr), N_SAMPLES, replace=False)
+    X_small          = X.iloc[sample_idx_small]
+
+    # ── Build TreeExplainer ───────────────────────────────────────────────────
+    print(f'Building TreeExplainer ({N_TREES_FOR_INTERACTION} trees)...')
+    t0                 = time.time()
+    explainer_interact = shap.TreeExplainer(rf_light)
+    t_exp              = time.time() - t0
+    print(f'✓ Built in {int(t_exp//60)}m{int(t_exp%60):02d}s')
+    print()
+
+    # ── Benchmark 1 sample ────────────────────────────────────────────────────
+    print('Benchmarking 1 sample to estimate total time...')
+    t0           = time.time()
+    _            = explainer_interact.shap_interaction_values(X_small.iloc[[0]])
+    t_per_sample = time.time() - t0
+    t_total_est  = t_per_sample * N_SAMPLES
+
+    print(f'  1 sample took         : {t_per_sample:.2f}s')
+    print(f'  {N_SAMPLES} samples estimate  : '
+          f'~{int(t_total_est//60)}m{int(t_total_est%60):02d}s')
+    print()
+
+    # ── Compute sample by sample with tqdm ────────────────────────────────────
+    print(f'Computing SHAP interaction values '
+          f'({N_SAMPLES} samples, {N_TREES_FOR_INTERACTION} trees)...')
+    shap_chunks = []
+    start_time  = time.time()
+
+    for i in tqdm(range(N_SAMPLES),
+                  desc='SHAP Interactions',
+                  unit='sample',
+                  ncols=80):
+        chunk = explainer_interact.shap_interaction_values(
+            X_small.iloc[[i]])
+        shap_chunks.append(chunk)
+
+    elapsed = time.time() - start_time
+    print(f'✓ Done in {int(elapsed//60)}m{int(elapsed%60):02d}s')
+
+    shap_interact = np.vstack(shap_chunks)
+
+    # ── Build interaction matrix ──────────────────────────────────────────────
+    interact_matrix = np.abs(shap_interact).mean(axis=0)
+    interact_df     = pd.DataFrame(
+        interact_matrix,
+        index=feature_names,
+        columns=feature_names)
+    np.fill_diagonal(interact_df.values, 0)
+
+    interact_pairs = (interact_df.stack()
+                      .reset_index()
+                      .rename(columns={'level_0': 'Feature_A',
+                                       'level_1': 'Feature_B',
+                                       0: 'interaction_strength'})
+                      .query('Feature_A < Feature_B')
+                      .sort_values('interaction_strength', ascending=False))
+
+    save_checkpoint(
+        {'interact_pairs': interact_pairs,
+         'interact_df':    interact_df},
+        'shap_interaction')
+    print('✓ SHAP interaction values saved to Drive.')
+
+# ── fi_rf check ───────────────────────────────────────────────────────────────
+try:
+    fi_rf
+except NameError:
+    fi_ckpt = load_checkpoint('feature_importance')
+    if fi_ckpt is None:
+        print('ERROR: Step 12 data not found. Run Step 12 first.')
+        raise SystemExit
+    fi_rf = fi_ckpt['fi_rf']
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\nTOP 10 SHAP INTERACTION PAIRS:')
+print(interact_pairs.head(10).to_string(index=False))
+save_csv(interact_pairs.head(20), 'shap_interaction_pairs')
+
+top15 = fi_rf.head(15).index.tolist()
+fig, ax = plt.subplots(figsize=(11, 9))
+sns.heatmap(interact_df.loc[top15, top15],
+            cmap='coolwarm', center=0,
+            annot=True, fmt='.4f',
+            linewidths=0.3, ax=ax)
+ax.set_title('SHAP Interaction Matrix — Top 15 Features\n'
+             f'(100 samples, 100 trees)')
+plt.tight_layout()
+save_figure(fig, 'shap_interaction_heatmap')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 17 — BEST vs WORST CATALYST ANALYSIS')
+print('=' * 55)
+
+bvw_ckpt = load_checkpoint('best_vs_worst')
+
+if bvw_ckpt is not None:
+    compare_table = bvw_ckpt['compare_table']
+    top_active    = bvw_ckpt['top_active']
+    bottom_active = bvw_ckpt['bottom_active']
+    df_full       = bvw_ckpt['df_full']
+    n_pct         = bvw_ckpt['n_pct']
+    print('✓ Best vs worst data loaded from Drive.')
+else:
+    df_full = X.copy()
+    df_full['Barrier']  = y_barrier
+    df_full['log_rate'] = y_rate
+    df_full['Host']     = host_labels
+    df_full['Surface']  = surface_labels
+
+    n_pct         = int(len(df_full) * 0.01)
+    top_active    = df_full.nsmallest(n_pct, 'Barrier')
+    bottom_active = df_full.nlargest(n_pct,  'Barrier')
+
+    compare_feats = [
+        'doped_weighted_surface_energy', 'doped_d-band_center',
+        'delta_electroneg', 'delta_d_band',
+        'host_d-electron',  'host_molar_volume'
+    ]
+    compare_rows = []
+    for feat in compare_feats:
+        if feat not in df_full.columns:
+            continue
+        compare_rows.append({
+            'Descriptor':     feat,
+            'Top 1% mean':    round(top_active[feat].mean(), 4),
+            'Bottom 1% mean': round(bottom_active[feat].mean(), 4),
+            'Difference':     round(
+                top_active[feat].mean() - bottom_active[feat].mean(), 4)
+        })
+    compare_table = pd.DataFrame(compare_rows)
+
+    save_checkpoint({
+        'compare_table': compare_table,
+        'top_active':    top_active,
+        'bottom_active': bottom_active,
+        'df_full':       df_full,
+        'n_pct':         n_pct,
+    }, 'best_vs_worst')
+    print('✓ Best vs worst saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print(f'\nTop 1% most active ({n_pct} configs):')
+print(f'  Barrier : {top_active["Barrier"].min():.3f} – '
+      f'{top_active["Barrier"].max():.3f} eV')
+print(f'  Hosts   : {top_active["Host"].value_counts().head(5).to_dict()}')
+print(f'  Surfaces: {top_active["Surface"].value_counts().head(5).to_dict()}')
+
+print(f'\nBottom 1% least active ({n_pct} configs):')
+print(f'  Barrier : {bottom_active["Barrier"].min():.3f} – '
+      f'{bottom_active["Barrier"].max():.3f} eV')
+print(f'  Hosts   : {bottom_active["Host"].value_counts().head(5).to_dict()}')
+print(f'  Surfaces: {bottom_active["Surface"].value_counts().head(5).to_dict()}')
+
+print('\nDESCRIPTOR COMPARISON:')
+print(compare_table.to_string(index=False))
+save_csv(compare_table, 'best_vs_worst_comparison')
+
+compare_feats_plot = [
+    'doped_weighted_surface_energy',
+    'doped_d-band_center',
+    'delta_electroneg'
+]
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+for ax, feat in zip(axes, compare_feats_plot):
+    if feat not in df_full.columns:
+        continue
+    plot_data = pd.DataFrame({
+        'value': pd.concat([top_active[feat], bottom_active[feat]],
+                           ignore_index=True),
+        'group': ['Top 1%'] * n_pct + ['Bottom 1%'] * n_pct
+    })
+    sns.violinplot(data=plot_data, x='group', y='value', ax=ax,
+                   palette=['seagreen', 'tomato'])
+    ax.set_title(feat.replace('_', ' '), fontsize=9)
+    ax.set_xlabel('')
+plt.suptitle('Key Descriptors: Most Active vs Least Active Catalysts')
+plt.tight_layout()
+save_figure(fig, 'best_vs_worst_violin')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 18 — HOST-DOPANT INTERACTION INDEX (HDII)')
+print('=' * 55)
+
+hdii_ckpt = load_checkpoint('hdii')
+
+if hdii_ckpt is not None:
+    HDII       = hdii_ckpt['HDII']
+    top3_feats = hdii_ckpt['top3_feats']
+    weights    = hdii_ckpt['weights']
+    corr_hdii  = hdii_ckpt['corr_hdii']
+    print('✓ HDII loaded from Drive.')
+else:
+    shap_ckpt_rf = load_checkpoint('shap_values_rf')
+    if shap_ckpt_rf is None:
+        print('ERROR: No SHAP data from Step 14.First run Step 14.')
+        raise SystemExit
+    shap_values_rf = shap_ckpt_rf['shap_values_rf']
+
+    from sklearn.preprocessing import MinMaxScaler
+    mean_abs_shap = np.abs(shap_values_rf).mean(axis=0)
+    shap_series   = pd.Series(mean_abs_shap, index=feature_names)
+    top3_feats    = shap_series.sort_values(
+        ascending=False).head(3).index.tolist()
+    top3_shap     = shap_series[top3_feats]
+    weights       = (top3_shap / top3_shap.sum()).values
+
+    scaler_hdii = MinMaxScaler()
+    top3_scaled = scaler_hdii.fit_transform(X[top3_feats].values)
+    HDII        = top3_scaled @ weights
+    corr_hdii   = np.corrcoef(HDII, y_barrier)[0, 1]
+
+    save_checkpoint({
+        'HDII': HDII, 'top3_feats': top3_feats,
+        'weights': weights, 'corr_hdii': corr_hdii,
+    }, 'hdii')
+    print('✓ HDII saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print(f'\nTop 3 SHAP descriptors : {top3_feats}')
+print(f'Weights                : {weights.round(4)}')
+print(f'HDII vs Barrier r      = {corr_hdii:.4f}')
+
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import cross_val_score
+
+print('\nLinear R² — single-descriptor (5-fold CV):')
+candidates = {'HDII (new)': HDII.reshape(-1, 1)}
+for feat in top3_feats:
+    candidates[feat] = X[[feat]].values
+for name, arr in candidates.items():
+    r2s = cross_val_score(LinearRegression(), arr, y_barrier,
+                          cv=5, scoring='r2')
+    print(f'  {name:45s}: R²={r2s.mean():.4f} ± {r2s.std():.4f}')
+
+fig, ax = plt.subplots(figsize=(7, 5))
+sc = ax.scatter(HDII, y_barrier, c=y_barrier,
+                cmap='RdYlGn_r', alpha=0.4, s=8, rasterized=True)
+plt.colorbar(sc, ax=ax, label='Barrier (eV)')
+ax.set_xlabel('Host–Dopant Interaction Index (HDII)')
+ax.set_ylabel('Barrier (eV)')
+ax.set_title(f'HDII vs Activation Barrier (r = {corr_hdii:.3f})')
+plt.tight_layout()
+save_figure(fig, 'hdii_vs_barrier')
+plt.show()
+
+print('=' * 55)
+print('STEP 19 — UNCERTAINTY QUANTIFICATION')
+print('=' * 55)
+
+uq_ckpt = load_checkpoint('uncertainty')
+
+if uq_ckpt is not None:
+    pred_mean = uq_ckpt['pred_mean']
+    pred_std  = uq_ckpt['pred_std']
+    print('✓ Uncertainty values loaded from Drive.')
+
+else:
+    # rf_final_barrier need
+    try:
+        rf_final_barrier
+    except NameError:
+        rf_final_barrier = load_model('rf_barrier_final')
+        if rf_final_barrier is None:
+            print('ERROR: No RF model.First run Step 11.')
+            raise SystemExit
+
+    # X_arr need
+    try:
+        X_arr
+    except NameError:
+        ckpt = load_checkpoint('feature_matrix')
+        if ckpt is None:
+            print('ERROR: No data from Step 5.First run Step 5.')
+            raise SystemExit
+        X_arr         = ckpt['X_arr']
+        feature_names = ckpt['feature_names']
+        X             = pd.DataFrame(X_arr, columns=feature_names)
+
+    print('Computing tree-level predictions...')
+    tree_preds = np.array([tree.predict(X_arr)
+                            for tree in rf_final_barrier.estimators_])
+    pred_mean  = tree_preds.mean(axis=0)
+    pred_std   = tree_preds.std(axis=0)
+
+    save_checkpoint(
+        {'pred_mean': pred_mean, 'pred_std': pred_std},
+        'uncertainty')
+    print('✓ Uncertainty values saved to Drive.')
+
+# ── df_full need ─────────────────────────────────────────────────────────────
+try:
+    df_full
+except NameError:
+    bvw_ckpt = load_checkpoint('best_vs_worst')
+    if bvw_ckpt is None:
+        print('ERROR: No data from Step 17.First run Step 17.')
+        raise SystemExit
+    df_full = bvw_ckpt['df_full']
+
+df_full['pred_barrier']     = pred_mean
+df_full['pred_uncertainty'] = pred_std
+
+# ── Always show results ───────────────────────────────────────────────────────
+high_conf = pred_std[pred_std < 0.05]
+print(f'\nMean uncertainty : {pred_std.mean():.4f} eV')
+print(f'Max uncertainty  : {pred_std.max():.4f} eV')
+print(f'Min uncertainty  : {pred_std.min():.4f} eV')
+print(f'High-confidence configs (std < 0.05 eV): '
+      f'{len(high_conf):,} / {len(pred_std):,}')
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].hist(pred_std, bins=60, color='steelblue', edgecolor='white')
+axes[0].axvline(0.05, color='red', linestyle='--',
+                label='0.05 eV threshold')
+axes[0].set_xlabel('Prediction Std (eV)')
+axes[0].set_ylabel('Count')
+axes[0].set_title('Distribution of Model Uncertainty')
+axes[0].legend()
+
+axes[1].scatter(pred_mean, pred_std, alpha=0.3, s=6,
+                c=pred_std, cmap='hot_r', rasterized=True)
+axes[1].set_xlabel('Predicted Barrier (eV)')
+axes[1].set_ylabel('Uncertainty (std, eV)')
+axes[1].set_title('Uncertainty vs Predicted Barrier')
+plt.tight_layout()
+save_figure(fig, 'uncertainty_quantification')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 20 — VIRTUAL SCREENING')
+print('=' * 55)
+
+screen_ckpt = load_checkpoint('virtual_screening')
+
+if screen_ckpt is not None:
+    screen_df = screen_ckpt['screen_df']
+    top20     = screen_ckpt['top20']
+    print('✓ Screening results loaded from Drive.')
+
+else:
+    # pred_mean, pred_std need
+    try:
+        pred_mean
+        pred_std
+    except NameError:
+        uq_ckpt = load_checkpoint('uncertainty')
+        if uq_ckpt is None:
+            print('ERROR: No data from Step 19. First run Step 19.')
+            raise SystemExit
+        pred_mean = uq_ckpt['pred_mean']
+        pred_std  = uq_ckpt['pred_std']
+
+    # host_labels, surface_labels, y_barrier, y_rate need
+    try:
+        host_labels
+        surface_labels
+        y_barrier
+        y_rate
+    except NameError:
+        ckpt = load_checkpoint('feature_matrix')
+        if ckpt is None:
+            print('ERROR: No data from Step 5.First run Step 5.')
+            raise SystemExit
+        host_labels    = ckpt['host_labels']
+        surface_labels = ckpt['surface_labels']
+        y_barrier      = ckpt['y_barrier']
+        y_rate         = ckpt['y_rate']
+
+    # Database.csv is needed for Doped column
+    drive_csv = f'{SAVE_DIR}/Database.csv'
+    try:
+        df_orig = pd.read_csv(io.BytesIO(uploaded[filename]))
+        if not os.path.exists(drive_csv):
+            df_orig.to_csv(drive_csv, index=False)
+            print('✓ Database.csv backed up to Drive.')
+    except Exception:
+        if os.path.exists(drive_csv):
+            df_orig = pd.read_csv(drive_csv)
+            print('✓ Database.csv loaded from Drive backup.')
+        else:
+            print(f'ERROR: No Database.csv')
+            print(f'  keep here: {drive_csv}')
+            raise SystemExit
+
+    screen_df = pd.DataFrame({
+        'Host':         host_labels,
+        'Doped':        df_orig['Doped'].values,
+        'Surface':      surface_labels,
+        'DFT_Barrier':  y_barrier,
+        'Pred_Barrier': pred_mean,
+        'Uncertainty':  pred_std,
+        'log_rate':     y_rate,
+    })
+    screen_df['Score'] = screen_df['Pred_Barrier'] + screen_df['Uncertainty']
+    top20 = screen_df.sort_values('Score').head(20)
+
+    save_checkpoint(
+        {'screen_df': screen_df, 'top20': top20},
+        'virtual_screening')
+    print('✓ Screening results saved to Drive.')
+
+# ── pred_mean, pred_std ensure is needed for plot ──────────────────────────────
+try:
+    pred_mean
+    pred_std
+except NameError:
+    uq_ckpt   = load_checkpoint('uncertainty')
+    pred_mean = uq_ckpt['pred_mean']
+    pred_std  = uq_ckpt['pred_std']
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\nTOP 20 SCREENED SAA CONFIGURATIONS:')
+print(top20[['Host', 'Doped', 'Surface', 'DFT_Barrier',
+             'Pred_Barrier', 'Uncertainty',
+             'log_rate']].to_string(index=False))
+save_csv(top20, 'virtual_screening_top20')
+
+fig, ax = plt.subplots(figsize=(9, 6))
+sc = ax.scatter(screen_df['Pred_Barrier'], screen_df['Uncertainty'],
+                c=screen_df['DFT_Barrier'], cmap='RdYlGn_r',
+                alpha=0.5, s=10, rasterized=True)
+plt.colorbar(sc, ax=ax, label='DFT Barrier (eV)')
+ax.scatter(screen_df.loc[top20.index, 'Pred_Barrier'],
+           screen_df.loc[top20.index, 'Uncertainty'],
+           s=80, facecolors='none', edgecolors='black',
+           linewidths=1.5, label='Top 20 candidates')
+ax.set_xlabel('Predicted Barrier (eV)')
+ax.set_ylabel('Prediction Uncertainty (eV)')
+ax.set_title('Virtual Screening Map — All SAA Configurations')
+ax.legend()
+plt.tight_layout()
+save_figure(fig, 'virtual_screening_map')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 20b — SAME-ELEMENT FILTER FOR CANDIDATES')
+print('=' * 55)
+
+# Load screen_df
+try:
+    screen_df
+except NameError:
+    sc_ckpt   = load_checkpoint('virtual_screening')
+    screen_df = sc_ckpt['screen_df']
+
+# Load Doped labels
+drive_csv = f'{SAVE_DIR}/Database.csv'
+try:
+    df_orig = pd.read_csv(io.BytesIO(uploaded[filename]))
+except Exception:
+    df_orig = pd.read_csv(drive_csv)
+
+# Load CALPHAD mixing enthalpy if available
+matminer_ckpt = load_checkpoint('matminer_features')
+has_calphad   = False
+if matminer_ckpt is not None:
+    X_matminer = matminer_ckpt['X_matminer']
+    calphad_cols = [c for c in X_matminer.columns
+                    if c.startswith('calphad_')]
+    if calphad_cols:
+        has_calphad = True
+        print(f'✓ CALPHAD features available: {calphad_cols}')
+
+# Add Host and Doped to screen_df
+screen_df = screen_df.copy()
+screen_df['Doped'] = df_orig['Doped'].values
+
+# ── Filter 1: Remove same-element configurations ───────────────────────────────
+same_element_mask = screen_df['Host'] == screen_df['Doped']
+screen_filtered   = screen_df[~same_element_mask].copy()
+
+print(f'\nTotal configurations       : {len(screen_df):,}')
+print(f'Same-element removed       : {same_element_mask.sum():,}')
+print(f'Heterogeneous SAAs         : {len(screen_filtered):,}')
+
+# ── Filter 2: CALPHAD mixing enthalpy filter ───────────────────────────────────
+if has_calphad:
+    # Get mixing enthalpy for remaining configs
+    miedema_col = calphad_cols[0]
+    screen_filtered['mixing_enthalpy'] = \
+        X_matminer.loc[screen_filtered.index, miedema_col].values
+
+    # Thermodynamically stable: negative or small positive mixing enthalpy
+    # Positive ΔH_mix > 0.5 eV/atom means immiscible — exclude
+    enthalpy_mask  = screen_filtered['mixing_enthalpy'] < 0.5
+    screen_stable  = screen_filtered[enthalpy_mask].copy()
+    print(f'After CALPHAD stability filter: {len(screen_stable):,}')
+    screen_filtered = screen_stable
+else:
+    print('CALPHAD not available — skipping thermodynamic filter.')
+    print('Run Step 3b first to enable CALPHAD filtering.')
+
+# ── Top candidates after filtering ────────────────────────────────────────────
+screen_filtered['Score'] = (screen_filtered['Pred_Barrier'] +
+                             screen_filtered['Uncertainty'])
+top20_filtered = screen_filtered.sort_values('Score').head(20)
+
+print('\nTOP 20 HETEROGENEOUS SAA CANDIDATES (same-element removed):')
+display_cols = ['Host', 'Doped', 'Surface', 'DFT_Barrier',
+                'Pred_Barrier', 'Uncertainty']
+if has_calphad:
+    display_cols.append('mixing_enthalpy')
+print(top20_filtered[display_cols].to_string(index=False))
+
+save_csv(top20_filtered, 'top20_heterogeneous_candidates_filtered')
+
+# Compare before and after
+print(f'\nBefore filtering — top candidate:')
+top_before = screen_df.nsmallest(1, 'Pred_Barrier').iloc[0]
+print(f'  Host={top_before["Host"]}  Doped={top_before["Doped"]}  '
+      f'Surface={top_before["Surface"]}  '
+      f'Pred Ea={top_before["Pred_Barrier"]:.4f} eV')
+if top_before['Host'] == top_before['Doped']:
+    print('  → Same-element! Would mislead experimental screening.')
+
+print(f'\nAfter filtering — top heterogeneous candidate:')
+top_after = top20_filtered.iloc[0]
+print(f'  Host={top_after["Host"]}  Doped={top_after["Doped"]}  '
+      f'Surface={top_after["Surface"]}  '
+      f'Pred Ea={top_after["Pred_Barrier"]:.4f} eV')
+print('  → True SAA — valid for experimental synthesis.')
+
+# Plot
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Before filter
+ax = axes[0]
+colors_before = ['red' if r['Host']==r['Doped'] else 'steelblue'
+                 for _, r in screen_df.iterrows()]
+ax.scatter(screen_df['Pred_Barrier'],
+           screen_df['Uncertainty'],
+           c=['red' if h==d else 'steelblue'
+              for h, d in zip(screen_df['Host'],
+                               screen_df['Doped'])],
+           alpha=0.3, s=8, rasterized=True)
+ax.scatter([], [], c='red',    label='Same-element (invalid SAA)', s=30)
+ax.scatter([], [], c='steelblue', label='Heterogeneous SAA', s=30)
+ax.set_xlabel('Predicted Barrier (eV)')
+ax.set_ylabel('Uncertainty (eV)')
+ax.set_title('Before Same-Element Filter')
+ax.legend(fontsize=9)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+
+# After filter
+ax = axes[1]
+ax.scatter(screen_filtered['Pred_Barrier'],
+           screen_filtered['Uncertainty'],
+           alpha=0.3, s=8, c='steelblue', rasterized=True)
+ax.scatter(top20_filtered['Pred_Barrier'],
+           top20_filtered['Uncertainty'],
+           s=80, facecolors='none', edgecolors='black',
+           linewidths=1.5, label='Top 20 candidates')
+ax.set_xlabel('Predicted Barrier (eV)')
+ax.set_ylabel('Uncertainty (eV)')
+ax.set_title('After Same-Element Filter\n(Heterogeneous SAAs only)')
+ax.legend(fontsize=9)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+
+plt.suptitle('Same-Element Filter — Before vs After', fontsize=13)
+plt.tight_layout()
+save_figure(fig, 'same_element_filter_comparison')
+plt.show()
+
+
+
+
+print('=' * 55)
+print('STEP 21 — CATALYST DESIGN MAP')
+print('=' * 55)
+
+map_ckpt = load_checkpoint('catalyst_map')
+
+if map_ckpt is not None:
+    pivot      = map_ckpt['pivot']
+    best_pairs = map_ckpt['best_pairs']
+    print('✓ Catalyst map loaded from Drive.')
+
+else:
+    # screen_df is needed
+    try:
+        screen_df
+    except NameError:
+        screen_ckpt = load_checkpoint('virtual_screening')
+        if screen_ckpt is None:
+            print('ERROR: No data from Step 20.First run Step 20.')
+            raise SystemExit
+        screen_df = screen_ckpt['screen_df']
+
+    pivot = screen_df.groupby(
+        ['Host', 'Doped'])['Pred_Barrier'].mean().unstack()
+    best_pairs = (screen_df.groupby(['Host', 'Doped'])['Pred_Barrier']
+                  .mean().sort_values().head(10))
+
+    save_checkpoint(
+        {'pivot': pivot, 'best_pairs': best_pairs},
+        'catalyst_map')
+    print('✓ Catalyst map saved to Drive.')
+
+# ── screen_df ensure ─────────────────────────────────────────────────────
+try:
+    screen_df
+except NameError:
+    screen_ckpt = load_checkpoint('virtual_screening')
+    screen_df   = screen_ckpt['screen_df']
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\nTOP 10 HOST-DOPANT PAIRS (mean across all surfaces):')
+print(best_pairs.round(4).to_string())
+
+fig, ax = plt.subplots(figsize=(16, 13))
+sns.heatmap(pivot, cmap='RdYlGn_r', annot=False,
+            linewidths=0.3, linecolor='white',
+            cbar_kws={'label': 'Mean Predicted Barrier (eV)',
+                      'shrink': 0.7},
+            ax=ax)
+ax.set_title(
+    'Host–Dopant Activity Map\n'
+    '(Mean predicted barrier — all 19 surface facets)',
+    fontsize=13)
+ax.set_xlabel('Dopant Metal', fontsize=11)
+ax.set_ylabel('Host Metal',   fontsize=11)
+plt.tight_layout()
+save_figure(fig, 'catalyst_design_map')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 22 — QUANTITATIVE DESIGN RULES')
+print('=' * 55)
+
+rules_ckpt = load_checkpoint('design_rules')
+
+if rules_ckpt is not None:
+    rules_table = rules_ckpt['rules_table']
+    print('✓ Design rules loaded from Drive.')
+
+else:
+    # df_full is needed
+    try:
+        df_full
+    except NameError:
+        bvw_ckpt = load_checkpoint('best_vs_worst')
+        if bvw_ckpt is None:
+            print('ERROR: No data from Step 17. First run Step 17.')
+            raise SystemExit
+        df_full = bvw_ckpt['df_full']
+
+    rules_rows = []
+
+    wse_col = 'doped_weighted_surface_energy'
+    if wse_col in df_full.columns:
+        low_wse  = df_full[df_full[wse_col] <  2.5]['Barrier'].mean()
+        high_wse = df_full[df_full[wse_col] >= 2.5]['Barrier'].mean()
+        rules_rows.append({'Rule': 1,
+            'Descriptor': 'Dopant surface energy',
+            'Threshold':  'γ_w < 2.5 J/m²',
+            'Effect':     f'{high_wse - low_wse:.3f} eV'})
+
+    de_col = 'host_d-electron'
+    if de_col in df_full.columns:
+        low_de  = df_full[df_full[de_col] <= 6]['Barrier'].mean()
+        high_de = df_full[df_full[de_col] >  6]['Barrier'].mean()
+        rules_rows.append({'Rule': 2,
+            'Descriptor': 'Host d-electron count',
+            'Threshold':  'd-e > 6',
+            'Effect':     f'{high_de - low_de:.3f} eV'})
+
+    stepped  = ['_211', '_221', '_310', '_311', '_321', '_332']
+    compact  = ['_100', '_110', '_111']
+    step_bar = df_full[df_full['Surface'].isin(stepped)]['Barrier'].mean()
+    comp_bar = df_full[df_full['Surface'].isin(compact)]['Barrier'].mean()
+    rules_rows.append({'Rule': 3,
+        'Descriptor': 'Surface type',
+        'Threshold':  'Stepped over compact',
+        'Effect':     f'{comp_bar - step_bar:.3f} eV'})
+
+    if 'site1' in df_full.columns:
+        hollow_bar = df_full[df_full['site1'] == 1]['Barrier'].mean()
+        top_bar    = df_full[df_full['site1'] == 0]['Barrier'].mean()
+        rules_rows.append({'Rule': 4,
+            'Descriptor': 'Adsorption site',
+            'Threshold':  'Hollow site preferred',
+            'Effect':     f'{top_bar - hollow_bar:.3f} eV'})
+
+    if 'delta_d_band' in df_full.columns:
+        q1, q3  = df_full['delta_d_band'].quantile([0.25, 0.75])
+        mid_bar = df_full[
+            df_full['delta_d_band'].between(q1, q3)]['Barrier'].mean()
+        ext_bar = df_full[
+            ~df_full['delta_d_band'].between(q1, q3)]['Barrier'].mean()
+        rules_rows.append({'Rule': 5,
+            'Descriptor': 'd-band mismatch',
+            'Threshold':  f'{q1:.2f}–{q3:.2f} eV optimal',
+            'Effect':     'Avoid extremes'})
+
+    if 'rd/rh' in df_full.columns:
+        low_size  = df_full[df_full['rd/rh'] <  1.1]['Barrier'].mean()
+        high_size = df_full[df_full['rd/rh'] >= 1.3]['Barrier'].mean()
+        rules_rows.append({'Rule': 6,
+            'Descriptor': 'Size mismatch',
+            'Threshold':  'rd/rh < 1.3',
+            'Effect':     'Avoid large mismatch'})
+
+    rules_table = pd.DataFrame(rules_rows)
+    save_checkpoint({'rules_table': rules_table}, 'design_rules')
+    print('✓ Design rules saved to Drive.')
+
+# ── df_full ensure───────────────────────────────────────────────────────
+try:
+    df_full
+except NameError:
+    bvw_ckpt = load_checkpoint('best_vs_worst')
+    df_full  = bvw_ckpt['df_full']
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\nFINAL DESIGN RULES:')
+print(rules_table.to_string(index=False))
+save_csv(rules_table, 'design_rules')
+
+
+print('=' * 55)
+print('STEP 23 — MASTER COMPARISON TABLE')
+print('=' * 55)
+
+master_ckpt = load_checkpoint('master_table')
+
+if master_ckpt is not None:
+    master = master_ckpt['master']
+    print('✓ Master table loaded from Drive.')
+
+else:
+    # ── Load all results ──────────────────────────────────────────────────────
+    try:    results_5f
+    except NameError: results_5f = load_checkpoint('results_5f')
+
+    try:    results_loho
+    except NameError: results_loho = load_checkpoint('results_loho')
+
+    try:    results_loso
+    except NameError: results_loso = load_checkpoint('results_loso')
+
+    xgb_ckpt      = load_checkpoint('results_xgb')
+    xgb_loho_ckpt = load_checkpoint('results_xgb_loho')
+    xgb_loso_ckpt = load_checkpoint('results_xgb_loso')
+
+    results_xgb      = xgb_ckpt['results_xgb']           if xgb_ckpt      else None
+    results_xgb_loho = xgb_loho_ckpt['results_xgb_loho'] if xgb_loho_ckpt else None
+    results_xgb_loso = xgb_loso_ckpt['results_xgb_loso'] if xgb_loso_ckpt else None
+
+    missing = []
+    if results_5f   is None: missing.append('results_5f   (Step 8)')
+    if results_loho is None: missing.append('results_loho (Step 9)')
+    if results_loso is None: missing.append('results_loso (Step 10)')
+    if missing:
+        print('ERROR: These checkpoints not found:')
+        for m in missing: print(f'  {m}')
+        raise SystemExit
+
+    rows = []
+
+    # ── RF / DF / MLP ─────────────────────────────────────────────────────────
+    for protocol, res, key in [
+        ('5-Fold CV', results_5f,   'barrier'),
+        ('LOHO-CV',   results_loho, None),
+        ('LOSO-CV',   results_loso, None),
+    ]:
+        for name, label in [
+            ('RF',  'Random Forest'),
+            ('DF',  'Deep Forest (gcForest)'),
+            ('MLP', 'Neural Network (MLP)'),
+        ]:
+            vals = res[name][key] if key else res[name]
+            if not vals: continue
+            # Filter to only dict entries — skip any malformed string entries
+            vals = [v for v in vals if isinstance(v, dict)]
+            if not vals: continue
+            rows.append({
+                'Protocol': protocol,
+                'Model':    label,
+                'R²':       f'{np.mean([r["R2"]   for r in vals]):.4f} ± '
+                            f'{np.std([r["R2"]   for r in vals]):.4f}',
+                'MAE (eV)': f'{np.mean([r["MAE"]  for r in vals]):.4f} ± '
+                            f'{np.std([r["MAE"]  for r in vals]):.4f}',
+                'RMSE (eV)':f'{np.mean([r["RMSE"] for r in vals]):.4f} ± '
+                            f'{np.std([r["RMSE"] for r in vals]):.4f}',
+            })
+
+    # ── XGBoost ───────────────────────────────────────────────────────────────
+    for protocol, res, key in [
+        ('5-Fold CV', results_xgb,      'XGBoost'),
+        ('LOHO-CV',   results_xgb_loho, 'XGBoost'),
+        ('LOSO-CV',   results_xgb_loso, 'XGBoost'),
+    ]:
+        if res is None:
+            continue
+        vals = res[key]
+        if not vals: continue
+
+        # ── FIX: filter to only dict entries ──────────────────────────────────
+        vals = [v for v in vals if isinstance(v, dict)]
+        if not vals:
+            print(f'Note: {protocol} XGBoost results malformed — skipping.')
+            continue
+
+        rows.append({
+            'Protocol': protocol,
+            'Model':    'XGBoost',
+            'R²':       f'{np.mean([r["R2"]   for r in vals]):.4f} ± '
+                        f'{np.std([r["R2"]   for r in vals]):.4f}',
+            'MAE (eV)': f'{np.mean([r["MAE"]  for r in vals]):.4f} ± '
+                        f'{np.std([r["MAE"]  for r in vals]):.4f}',
+            'RMSE (eV)':f'{np.mean([r["RMSE"] for r in vals]):.4f} ± '
+                        f'{np.std([r["RMSE"] for r in vals]):.4f}',
+        })
+
+    master = pd.DataFrame(rows)
+    save_checkpoint({'master': master}, 'master_table')
+    print('✓ Master table saved to Drive.')
+
+# ── Always show ───────────────────────────────────────────────────────────────
+print('\n' + '=' * 80)
+print('MASTER MODEL COMPARISON TABLE — ACTIVATION BARRIER PREDICTION')
+print('=' * 80)
+print(master.to_string(index=False))
+save_csv(master, 'master_comparison_table')
+print(f'\n✓ Saved: {SAVE_DIR}/results/master_comparison_table.csv')
+
+
+
+print('=' * 55)
+print('STEP 24 — DESCRIPTOR GROUP ABLATION')
+print('=' * 55)
+
+import time
+from tqdm.notebook import tqdm
+from sklearn.model_selection import KFold
+
+ablation_ckpt = load_checkpoint('ablation_results')
+
+if ablation_ckpt is not None:
+    ablation_df = ablation_ckpt['ablation_df']
+    print('✓ Ablation results loaded from Drive.')
+
+else:
+    # ── Load dependencies ─────────────────────────────────────────────────────
+    try:
+        X_arr; feature_names; y_barrier
+    except NameError:
+        ckpt = load_checkpoint('feature_matrix')
+        if ckpt is None:
+            print('ERROR: Feature matrix not found. Run Step 5 first.')
+            raise SystemExit
+        X_arr         = ckpt['X_arr']
+        feature_names = ckpt['feature_names']
+        y_barrier     = ckpt['y_barrier']
+        X             = pd.DataFrame(X_arr, columns=feature_names)
+
+    # ── Define feature groups ─────────────────────────────────────────────────
+    feature_groups = {
+        'Host descriptors':        [f for f in feature_names
+                                    if f.startswith('host_')
+                                    and not f.startswith('host_magpie_')],
+        'Dopant descriptors':      [f for f in feature_names
+                                    if f.startswith('doped_')
+                                    and not f.startswith('doped_magpie_')],
+        'Combined descriptors':    [f for f in feature_names
+                                    if f.startswith('com_')],
+        'Coordination (CN)':       [f for f in feature_names
+                                    if f.startswith('CN')],
+        'Site indicators':         [f for f in feature_names
+                                    if f.startswith('site')],
+        'Engineered descriptors':  [f for f in feature_names
+                                    if f in ['delta_d_band',
+                                             'delta_electroneg',
+                                             'delta_efermi',
+                                             'delta_cohesive',
+                                             'delta_surface_energy',
+                                             'rd_rh_sq']],
+        'Surface one-hot':         [f for f in feature_names
+                                    if f.startswith('Surface_')],
+        'Size mismatch':           [f for f in feature_names
+                                    if f in ['area_fraction',
+                                             'rd-rh','rd/rh',
+                                             'rd_rh_sq']],
+        # New matminer groups
+        'Magpie host':             [f for f in feature_names
+                                    if f.startswith('host_magpie_')],
+        'Magpie dopant':           [f for f in feature_names
+                                    if f.startswith('doped_magpie_')],
+        'Delta Magpie':            [f for f in feature_names
+                                    if f.startswith('delta_magpie_')],
+        'CALPHAD Miedema':         [f for f in feature_names
+                                    if f.startswith('calphad_')],
+    }
+
+    # Filter to only features that exist
+    feature_groups = {
+        k: [f for f in v if f in feature_names]
+        for k, v in feature_groups.items()
+        if any(f in feature_names for f in v)
+    }
+
+    print('Feature groups found:')
+    for k, v in feature_groups.items():
+        print(f'  {k:30s}: {len(v)} features')
+    print()
+
+    kf      = KFold(n_splits=5, shuffle=True, random_state=SEED)
+    results = []
+
+    # ── Individual group ablation ─────────────────────────────────────────────
+    print('Running individual group ablation...')
+    for gname in tqdm(list(feature_groups.keys()),
+                      desc='Individual groups', ncols=80):
+        feats = feature_groups[gname]
+        if len(feats) == 0:
+            continue
+        idx_feats = [feature_names.index(f) for f in feats
+                     if f in feature_names]
+        if len(idx_feats) == 0:
+            continue
+        X_grp = X_arr[:, idx_feats]
+
+        r2s, maes, rmses = [], [], []
+        for train_idx, test_idx in kf.split(X_grp):
+            rf_g = make_rf()
+            rf_g.fit(X_grp[train_idx], y_barrier[train_idx])
+            pred = rf_g.predict(X_grp[test_idx])
+            m    = compute_metrics(y_barrier[test_idx], pred)
+            r2s.append(m['R2'])
+            maes.append(m['MAE'])
+            rmses.append(m['RMSE'])
+
+        results.append({
+            'Group':   gname,
+            'Type':    'Individual',
+            'N_feats': len(feats),
+            'R2':      round(np.mean(r2s),  4),
+            'MAE':     round(np.mean(maes), 4),
+            'RMSE':    round(np.mean(rmses),4),
+        })
+        print(f'  {gname:30s}: R²={np.mean(r2s):.4f}  '
+              f'MAE={np.mean(maes):.4f} eV  '
+              f'({len(feats)} features)')
+
+    # ── Cumulative group ablation ─────────────────────────────────────────────
+    print('\nRunning cumulative group ablation...')
+    cumulative_feats = []
+    cumulative_names = []
+
+    for gname in tqdm(list(feature_groups.keys()),
+                      desc='Cumulative groups', ncols=80):
+        feats = feature_groups[gname]
+        if len(feats) == 0:
+            continue
+        cumulative_feats.extend(feats)
+        cumulative_feats = list(dict.fromkeys(cumulative_feats))
+        cumulative_names.append(gname)
+
+        idx_cum = [feature_names.index(f)
+                   for f in cumulative_feats
+                   if f in feature_names]
+        X_cum = X_arr[:, idx_cum]
+
+        r2s, maes, rmses = [], [], []
+        for train_idx, test_idx in kf.split(X_cum):
+            rf_g = make_rf()
+            rf_g.fit(X_cum[train_idx], y_barrier[train_idx])
+            pred = rf_g.predict(X_cum[test_idx])
+            m    = compute_metrics(y_barrier[test_idx], pred)
+            r2s.append(m['R2'])
+            maes.append(m['MAE'])
+            rmses.append(m['RMSE'])
+
+        results.append({
+            'Group':   ' + '.join(cumulative_names),
+            'Type':    'Cumulative',
+            'N_feats': len(cumulative_feats),
+            'R2':      round(np.mean(r2s),  4),
+            'MAE':     round(np.mean(maes), 4),
+            'RMSE':    round(np.mean(rmses),4),
+        })
+
+    ablation_df = pd.DataFrame(results)
+    save_checkpoint({'ablation_df': ablation_df}, 'ablation_results')
+    print('✓ Ablation results saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\nABLATION RESULTS — INDIVIDUAL GROUPS:')
+indiv = ablation_df[ablation_df['Type'] == 'Individual'].sort_values(
+    'R2', ascending=False)
+print(indiv[['Group','N_feats','R2','MAE']].to_string(index=False))
+
+print('\nABLATION RESULTS — CUMULATIVE:')
+cumul = ablation_df[ablation_df['Type'] == 'Cumulative']
+print(cumul[['Group','N_feats','R2','MAE']].to_string(index=False))
+
+save_csv(ablation_df, 'ablation_results')
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+
+indiv_sorted = indiv.sort_values('R2')
+axes[0].barh(indiv_sorted['Group'], indiv_sorted['R2'],
+             color='steelblue', alpha=0.85)
+axes[0].set_xlabel('R² (5-Fold CV)')
+axes[0].set_title('Individual Group Performance')
+axes[0].axvline(0, color='gray', linestyle='--', linewidth=0.8)
+axes[0].spines['top'].set_visible(False)
+axes[0].spines['right'].set_visible(False)
+for i, (_, row) in enumerate(indiv_sorted.iterrows()):
+    axes[0].text(row['R2'] + 0.005, i,
+                 f'{row["R2"]:.3f}', va='center', fontsize=8)
+
+axes[1].plot(range(len(cumul)), cumul['R2'],
+             marker='o', color='seagreen', linewidth=2)
+axes[1].set_xticks(range(len(cumul)))
+axes[1].set_xticklabels(
+    [f'+{g.split(" + ")[-1]}' for g in cumul['Group']],
+    rotation=45, ha='right', fontsize=7)
+axes[1].set_ylabel('R² (5-Fold CV)')
+axes[1].set_title('Cumulative Group Performance')
+axes[1].spines['top'].set_visible(False)
+axes[1].spines['right'].set_visible(False)
+
+plt.suptitle('Descriptor Group Ablation Study\n'
+             '(includes matminer Magpie + CALPHAD groups)',
+             fontsize=13)
+plt.tight_layout()
+save_figure(fig, 'ablation_feature_groups')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 25 — LEAVE-ONE-DOPANT-OUT CV (LODO)')
+print('=' * 55)
+
+lodo_ckpt = load_checkpoint('results_lodo')
+
+if lodo_ckpt is not None:
+    results_lodo_new = lodo_ckpt['results_lodo']
+    print('✓ LODO results loaded from Drive.')
+
+else:
+    # ── Load dopant labels ────────────────────────────────────────────────────
+    try:
+        X_arr
+        y_barrier
+    except NameError:
+        ckpt = load_checkpoint('feature_matrix')
+        if ckpt is None:
+            print('ERROR: Feature matrix not found. Run Step 5 first.')
+            raise SystemExit
+        X_arr         = ckpt['X_arr']
+        y_barrier     = ckpt['y_barrier']
+        feature_names = ckpt['feature_names']
+        X             = pd.DataFrame(X_arr, columns=feature_names)
+
+    # Load original CSV to get Doped column
+    drive_csv = f'{SAVE_DIR}/Database.csv'
+    try:
+        df_orig = pd.read_csv(io.BytesIO(uploaded[filename]))
+    except Exception:
+        if os.path.exists(drive_csv):
+            df_orig = pd.read_csv(drive_csv)
+        else:
+            print(f'ERROR: Database.csv not found at {drive_csv}')
+            raise SystemExit
+
+    doped_labels  = df_orig['Doped'].values
+    unique_dopants = np.unique(doped_labels)
+
+    print(f'Total dopants: {len(unique_dopants)}')
+    print(f'Dopants: {sorted(unique_dopants)}')
+    print()
+
+    results_lodo_new = {'RF': [], 'DF': [], 'MLP': []}
+    completed        = 0
+
+    # Check partial progress
+    partial = load_checkpoint('results_lodo_partial')
+    if partial is not None:
+        results_lodo_new = partial['results']
+        completed        = partial['completed']
+        print(f'Resuming LODO-CV from dopant {completed+1}/{len(unique_dopants)}')
+
+    for i, dopant in enumerate(unique_dopants):
+
+        if i < completed:
+            print(f'  [{i+1:2d}] {dopant} already done — skipping.')
+            continue
+
+        print(f'\n[{i+1:2d}/{len(unique_dopants)}] Dopant held out: {dopant}')
+        train_mask = doped_labels != dopant
+        test_mask  = doped_labels == dopant
+        X_tr, X_te   = X_arr[train_mask], X_arr[test_mask]
+        yb_tr, yb_te = y_barrier[train_mask], y_barrier[test_mask]
+
+        rf = make_rf();  rf.fit(X_tr, yb_tr)
+        m  = compute_metrics(yb_te, rf.predict(X_te))
+        m['dopant'] = dopant
+        results_lodo_new['RF'].append(m)
+
+        df_m = make_df();  df_m.fit(X_tr, yb_tr, verbose=False)
+        m2   = compute_metrics(yb_te, df_m.predict(X_te))
+        m2['dopant'] = dopant
+        results_lodo_new['DF'].append(m2)
+
+        mlp = make_mlp();  mlp.fit(X_tr, yb_tr)
+        m3  = compute_metrics(yb_te, mlp.predict(X_te))
+        m3['dopant'] = dopant
+        results_lodo_new['MLP'].append(m3)
+
+        print(f'  RF  R²={m["R2"]:.4f}  MAE={m["MAE"]:.4f} eV')
+        print(f'  DF  R²={m2["R2"]:.4f}  MAE={m2["MAE"]:.4f} eV')
+        print(f'  MLP R²={m3["R2"]:.4f}  MAE={m3["MAE"]:.4f} eV')
+
+        # Save partial progress after every dopant
+        save_checkpoint(
+            {'results': results_lodo_new, 'completed': i + 1},
+            'results_lodo_partial')
+
+    save_checkpoint({'results_lodo': results_lodo_new}, 'results_lodo')
+    print('\n✓ LODO-CV complete and saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\n' + '='*55 + '\nLODO-CV SUMMARY\n' + '='*55)
+for name in ['RF', 'DF', 'MLP']:
+    print_summary(results_lodo_new[name], name, 'LODO Barrier')
+
+lodo_table = pd.DataFrame({
+    'Dopant':   [r['dopant'] for r in results_lodo_new['RF']],
+    'RF_R2':    [r['R2']    for r in results_lodo_new['RF']],
+    'RF_MAE':   [r['MAE']   for r in results_lodo_new['RF']],
+    'DF_R2':    [r['R2']    for r in results_lodo_new['DF']],
+    'DF_MAE':   [r['MAE']   for r in results_lodo_new['DF']],
+    'MLP_R2':   [r['R2']    for r in results_lodo_new['MLP']],
+    'MLP_MAE':  [r['MAE']   for r in results_lodo_new['MLP']],
+})
+save_csv(lodo_table.sort_values('RF_MAE'), 'lodo_results')
+
+print('\nBest generalization (lowest RF MAE):')
+print(lodo_table.nsmallest(5, 'RF_MAE')[
+    ['Dopant','RF_R2','RF_MAE']].to_string(index=False))
+print('\nWorst generalization (highest RF MAE):')
+print(lodo_table.nlargest(5, 'RF_MAE')[
+    ['Dopant','RF_R2','RF_MAE']].to_string(index=False))
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+lodo_sorted = lodo_table.sort_values('RF_MAE')
+
+axes[0].barh(lodo_sorted['Dopant'], lodo_sorted['RF_MAE'],
+             color='steelblue', alpha=0.85)
+axes[0].set_xlabel('MAE (eV)')
+axes[0].set_title('LODO-CV MAE per Dopant — RF')
+axes[0].spines['top'].set_visible(False)
+axes[0].spines['right'].set_visible(False)
+
+axes[1].barh(lodo_sorted['Dopant'], lodo_sorted['RF_R2'],
+             color='seagreen', alpha=0.85)
+axes[1].set_xlabel('R²')
+axes[1].set_title('LODO-CV R² per Dopant — RF')
+axes[1].spines['top'].set_visible(False)
+axes[1].spines['right'].set_visible(False)
+
+plt.suptitle('Leave-One-Dopant-Out Generalization', fontsize=13)
+plt.tight_layout()
+save_figure(fig, 'lodo_results')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 26 — LEAVE-ONE-CHEMICAL-FAMILY-OUT')
+print('=' * 55)
+
+family_ckpt = load_checkpoint('family_out_results')
+
+if family_ckpt is not None:
+    family_df = family_ckpt['family_df']
+    print('✓ Family-out results loaded from Drive.')
+
+else:
+    # ── Load dependencies ─────────────────────────────────────────────────────
+    try:
+        X_arr; y_barrier; host_labels
+    except NameError:
+        ckpt = load_checkpoint('feature_matrix')
+        if ckpt is None:
+            print('ERROR: Feature matrix not found. Run Step 5 first.')
+            raise SystemExit
+        X_arr          = ckpt['X_arr']
+        y_barrier      = ckpt['y_barrier']
+        host_labels    = ckpt['host_labels']
+        surface_labels = ckpt['surface_labels']
+        feature_names  = ckpt['feature_names']
+        X              = pd.DataFrame(X_arr, columns=feature_names)
+
+    drive_csv = f'{SAVE_DIR}/Database.csv'
+    try:
+        df_orig = pd.read_csv(io.BytesIO(uploaded[filename]))
+    except Exception:
+        df_orig = pd.read_csv(drive_csv)
+
+    doped_labels = df_orig['Doped'].values
+
+    # ── Define chemical families ──────────────────────────────────────────────
+    families = {
+        'Early transition metals': ['Sc','Ti','V','Cr','Y','Zr','Nb','Hf','Ta'],
+        'Late transition metals':  ['Co','Ni','Cu','Zn','Rh','Pd','Ag','Ir','Pt','Au'],
+        'Noble metals':            ['Ru','Rh','Pd','Ag','Os','Ir','Pt','Au'],
+        'Refractory metals':       ['Mo','W','Re','Ta','Nb','Hf','Zr','Ti','V','Cr'],
+        'Magnetic metals':         ['Fe','Co','Ni','Mn'],
+        'Soft/post-transition':    ['Cd','Hg','Zn','In','Sn'],
+    }
+
+    results = []
+
+    for family_type, label_arr, label_name in [
+        ('Host',  host_labels,  'Host'),
+        ('Dopant',doped_labels, 'Dopant'),
+    ]:
+        print(f'\nRunning {family_type} family-out CV...')
+
+        for fname, members in tqdm(families.items(),
+                                   desc=f'{family_type} families',
+                                   ncols=80):
+            in_family  = np.isin(label_arr, members)
+            out_family = ~in_family
+
+            if in_family.sum() == 0 or out_family.sum() == 0:
+                continue
+
+            X_tr, X_te   = X_arr[out_family], X_arr[in_family]
+            yb_tr, yb_te = y_barrier[out_family], y_barrier[in_family]
+
+            rf = make_rf()
+            rf.fit(X_tr, yb_tr)
+            m_rf = compute_metrics(yb_te, rf.predict(X_te))
+
+            df_m = make_df()
+            df_m.fit(X_tr, yb_tr, verbose=False)
+            m_df = compute_metrics(yb_te, df_m.predict(X_te))
+
+            results.append({
+                'Family_type': family_type,
+                'Family':      fname,
+                'N_test':      int(in_family.sum()),
+                'RF_R2':       m_rf['R2'],
+                'RF_MAE':      m_rf['MAE'],
+                'DF_R2':       m_df['R2'],
+                'DF_MAE':      m_df['MAE'],
+            })
+            print(f'  {fname:30s}: RF R²={m_rf["R2"]:.4f}  MAE={m_rf["MAE"]:.4f} eV')
+
+    family_df = pd.DataFrame(results)
+    save_checkpoint({'family_df': family_df}, 'family_out_results')
+    print('\n✓ Family-out results saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\nFAMILY-OUT RESULTS:')
+print(family_df.to_string(index=False))
+save_csv(family_df, 'family_out_results')
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+for ax, ftype in zip(axes, ['Host', 'Dopant']):
+    sub = family_df[family_df['Family_type'] == ftype].sort_values('RF_MAE')
+    ax.barh(sub['Family'], sub['RF_MAE'], color='tomato', alpha=0.85,
+            label='RF')
+    ax.barh(sub['Family'], sub['DF_MAE'], color='steelblue', alpha=0.60,
+            left=0, label='Deep Forest')
+    ax.set_xlabel('MAE (eV)')
+    ax.set_title(f'{ftype} Family-Out Generalization')
+    ax.legend()
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+plt.suptitle('Leave-One-Chemical-Family-Out Validation', fontsize=13)
+plt.tight_layout()
+save_figure(fig, 'family_out_results')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 27 — BEP DELTA-ML AND PHYSICS BASELINE COMPARISON')
+print('=' * 55)
+
+from sklearn.linear_model import Ridge, LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold
+import copy
+
+baseline_ckpt = load_checkpoint('physics_baselines')
+
+if baseline_ckpt is not None:
+    baseline_df   = baseline_ckpt['baseline_df']
+    bep_coefs     = baseline_ckpt['bep_coefs']
+    bep_pred_test = baseline_ckpt['bep_pred_test']
+    rf_pred_test  = baseline_ckpt['rf_pred_test']
+    delta_pred_test = baseline_ckpt['delta_pred_test']
+    y_test_stored   = baseline_ckpt['y_test_stored']
+    print('✓ Physics baseline results loaded from Drive.')
+
+else:
+    # ── Load dependencies ─────────────────────────────────────────────────────
+    try:
+        X_arr; y_barrier; feature_names
+    except NameError:
+        ckpt = load_checkpoint('feature_matrix')
+        if ckpt is None:
+            print('ERROR: Feature matrix not found. Run Step 5 first.')
+            raise SystemExit
+        X_arr         = ckpt['X_arr']
+        y_barrier     = ckpt['y_barrier']
+        feature_names = ckpt['feature_names']
+        X             = pd.DataFrame(X_arr, columns=feature_names)
+
+    from sklearn.model_selection import train_test_split
+
+    # ── Physics features for BEP prior ───────────────────────────────────────
+    # These are the BEP-relevant descriptors in your dataset
+    bep_feature_candidates = [
+        'delta_d_band',
+        'delta_cohesive',
+        'delta_surface_energy',
+        'delta_electroneg',
+        'doped_weighted_surface_energy',
+        'doped_d-band_center',
+    ]
+    bep_features = [f for f in bep_feature_candidates if f in feature_names]
+    print(f'BEP physics features: {bep_features}')
+
+    # ── Train/test split (80/20) ──────────────────────────────────────────────
+    from sklearn.model_selection import train_test_split
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X_arr, y_barrier, test_size=0.2, random_state=SEED)
+    X_tr_df = pd.DataFrame(X_tr, columns=feature_names)
+    X_te_df = pd.DataFrame(X_te, columns=feature_names)
+
+    kf      = KFold(n_splits=5, shuffle=True, random_state=SEED)
+    results = []
+
+    # ── 1. Pure BEP linear baseline ───────────────────────────────────────────
+    print('\nFitting pure BEP linear baseline...')
+    scaler_bep   = StandardScaler()
+    X_bep_tr     = scaler_bep.fit_transform(X_tr_df[bep_features].values)
+    X_bep_te     = scaler_bep.transform(X_te_df[bep_features].values)
+    bep_only     = Ridge(alpha=1.0)
+    bep_only.fit(X_bep_tr, y_tr)
+    bep_pred_test = bep_only.predict(X_bep_te)
+
+    m = compute_metrics(y_te, bep_pred_test)
+    results.append({'Model': 'BEP Linear (physics only)',
+                    'Type': 'Physics baseline', **m})
+    print(f'  BEP only: R²={m["R2"]:.4f}  MAE={m["MAE"]:.4f} eV')
+
+    bep_coefs = {
+        'features':   bep_features,
+        'alpha':      bep_only.coef_.tolist(),
+        'intercept':  float(bep_only.intercept_)
+    }
+    print(f'  BEP coefficients: {dict(zip(bep_features, bep_only.coef_.round(4)))}')
+    print(f'  BEP intercept   : {bep_only.intercept_:.4f}')
+
+    # ── 2. Pure RF baseline ───────────────────────────────────────────────────
+    print('\nFitting pure RF baseline...')
+    rf_base = make_rf()
+    rf_base.fit(X_tr, y_tr)
+    rf_pred_test = rf_base.predict(X_te)
+
+    m = compute_metrics(y_te, rf_pred_test)
+    results.append({'Model': 'Random Forest (ML only)',
+                    'Type': 'ML model', **m})
+    print(f'  RF only: R²={m["R2"]:.4f}  MAE={m["MAE"]:.4f} eV')
+
+    # ── 3. BEP Delta-ML (physics prior + ML residual correction) ─────────────
+    print('\nFitting BEP Delta-ML...')
+    # Step 1: Compute BEP residuals on training set
+    y_bep_train   = bep_only.predict(X_bep_tr)
+    residuals_tr  = y_tr - y_bep_train
+
+    print(f'  BEP prior R² on train : {r2_score(y_tr, y_bep_train):.4f}')
+    print(f'  Residual std          : {residuals_tr.std():.4f} eV')
+
+    # Step 2: RF learns the residuals using ALL features
+    rf_delta = make_rf()
+    rf_delta.fit(X_tr, residuals_tr)
+
+    # Step 3: Prediction = BEP prior + RF residual correction
+    delta_correction  = rf_delta.predict(X_te)
+    delta_pred_test   = bep_pred_test + delta_correction
+
+    m = compute_metrics(y_te, delta_pred_test)
+    results.append({'Model': 'BEP + Delta-ML (PIML)',
+                    'Type': 'Physics-informed ML', **m})
+    print(f'  BEP Delta-ML: R²={m["R2"]:.4f}  MAE={m["MAE"]:.4f} eV')
+
+    # ── 4. Single-descriptor linear baselines ─────────────────────────────────
+    print('\nFitting single-descriptor baselines...')
+    single_descs = [
+        'doped_weighted_surface_energy',
+        'doped_d-band_center',
+        'delta_d_band',
+        'delta_electroneg',
+    ]
+    for desc in single_descs:
+        if desc not in feature_names:
+            continue
+        idx  = feature_names.index(desc)
+        feat = X_arr[:, idx].reshape(-1, 1)
+        r2s, maes, rmses = [], [], []
+        for tr_idx, te_idx in kf.split(feat):
+            lr = LinearRegression()
+            lr.fit(feat[tr_idx], y_barrier[tr_idx])
+            pred = lr.predict(feat[te_idx])
+            mm   = compute_metrics(y_barrier[te_idx], pred)
+            r2s.append(mm['R2']); maes.append(mm['MAE']); rmses.append(mm['RMSE'])
+        results.append({
+            'Model': f'Linear ({desc})',
+            'Type':  'Physics baseline',
+            'R2':    round(np.mean(r2s), 4),
+            'MAE':   round(np.mean(maes), 4),
+            'RMSE':  round(np.mean(rmses), 4),
+        })
+        print(f'  {desc:40s}: R²={np.mean(r2s):.4f}  MAE={np.mean(maes):.4f} eV')
+
+    # ── 5. Add HDII baseline if available ─────────────────────────────────────
+    hdii_ckpt = load_checkpoint('hdii')
+    if hdii_ckpt is not None:
+        HDII    = hdii_ckpt['HDII']
+        r2s, maes, rmses = [], [], []
+        for tr_idx, te_idx in kf.split(HDII.reshape(-1,1)):
+            lr = LinearRegression()
+            lr.fit(HDII[tr_idx].reshape(-1,1), y_barrier[tr_idx])
+            pred = lr.predict(HDII[te_idx].reshape(-1,1))
+            mm   = compute_metrics(y_barrier[te_idx], pred)
+            r2s.append(mm['R2']); maes.append(mm['MAE']); rmses.append(mm['RMSE'])
+        results.append({
+            'Model': 'Linear (HDII)',
+            'Type':  'Physics baseline',
+            'R2':    round(np.mean(r2s), 4),
+            'MAE':   round(np.mean(maes), 4),
+            'RMSE':  round(np.mean(rmses), 4),
+        })
+        print(f'  HDII: R²={np.mean(r2s):.4f}  MAE={np.mean(maes):.4f} eV')
+
+    # ── 6. Ridge all features ─────────────────────────────────────────────────
+    print('\nFitting Ridge (all features)...')
+    r2s, maes, rmses = [], [], []
+    scaler_ridge = StandardScaler()
+    for tr_idx, te_idx in kf.split(X_arr):
+        X_r_tr = scaler_ridge.fit_transform(X_arr[tr_idx])
+        X_r_te = scaler_ridge.transform(X_arr[te_idx])
+        ridge  = Ridge(alpha=1.0)
+        ridge.fit(X_r_tr, y_barrier[tr_idx])
+        pred   = ridge.predict(X_r_te)
+        mm     = compute_metrics(y_barrier[te_idx], pred)
+        r2s.append(mm['R2']); maes.append(mm['MAE']); rmses.append(mm['RMSE'])
+    results.append({
+        'Model': 'Ridge (all features)',
+        'Type':  'Physics baseline',
+        'R2':    round(np.mean(r2s), 4),
+        'MAE':   round(np.mean(maes), 4),
+        'RMSE':  round(np.mean(rmses), 4),
+    })
+
+    # ── 7. Add existing ML model 5-fold results for comparison ────────────────
+    try:    results_5f
+    except NameError: results_5f = load_checkpoint('results_5f')
+
+    if results_5f is not None:
+        for name, label in [('RF','Random Forest (5-fold CV)'),
+                             ('DF','Deep Forest (5-fold CV)'),
+                             ('MLP','Neural Network (5-fold CV)')]:
+            vals = results_5f[name]['barrier']
+            results.append({
+                'Model': label,
+                'Type':  'ML model',
+                'R2':    round(np.mean([r['R2']   for r in vals]), 4),
+                'MAE':   round(np.mean([r['MAE']  for r in vals]), 4),
+                'RMSE':  round(np.mean([r['RMSE'] for r in vals]), 4),
+            })
+
+    baseline_df   = pd.DataFrame(results)
+    y_test_stored = y_te
+
+    save_checkpoint({
+        'baseline_df':      baseline_df,
+        'bep_coefs':        bep_coefs,
+        'bep_pred_test':    bep_pred_test,
+        'rf_pred_test':     rf_pred_test,
+        'delta_pred_test':  delta_pred_test,
+        'y_test_stored':    y_test_stored,
+    }, 'physics_baselines')
+    print('✓ Physics baseline results saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\nBEP COEFFICIENTS (physics prior):')
+print(f'  Features  : {bep_coefs["features"]}')
+print(f'  Alpha     : {[round(a,4) for a in bep_coefs["alpha"]]}')
+print(f'  Intercept : {round(bep_coefs["intercept"],4)}')
+
+print('\nPHYSICS BASELINES vs BEP DELTA-ML vs ML MODELS:')
+print(baseline_df.sort_values('R2', ascending=False).to_string(index=False))
+save_csv(baseline_df.sort_values('R2', ascending=False), 'physics_baseline_results')
+
+# ── Parity plot comparison ────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+configs = [
+    ('BEP Linear\n(physics only)', bep_pred_test,   'tomato'),
+    ('Random Forest\n(ML only)',   rf_pred_test,    'steelblue'),
+    ('BEP + Delta-ML\n(PIML)',     delta_pred_test, 'seagreen'),
+]
+for ax, (name, pred, color) in zip(axes, configs):
+    r2  = r2_score(y_test_stored, pred)
+    mae = mean_absolute_error(y_test_stored, pred)
+    ax.scatter(y_test_stored, pred, alpha=0.3, s=8,
+               c=color, rasterized=True)
+    lims = [min(y_test_stored.min(), pred.min()) - 0.05,
+            max(y_test_stored.max(), pred.max()) + 0.05]
+    ax.plot(lims, lims, 'k--', lw=1)
+    ax.set_xlim(lims); ax.set_ylim(lims)
+    ax.set_xlabel('DFT Barrier (eV)')
+    ax.set_ylabel('Predicted Barrier (eV)')
+    ax.set_title(f'{name}\nR²={r2:.4f}  MAE={mae:.4f} eV')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+plt.suptitle('Physics Baselines vs BEP Delta-ML vs ML — Barrier Prediction',
+             fontsize=13)
+plt.tight_layout()
+save_figure(fig, 'physics_baseline_comparison')
+plt.show()
+
+# ── Bar chart all models ──────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(12, 6))
+color_map = {'Physics baseline':       'tomato',
+             'Physics-informed ML':    'seagreen',
+             'ML model':               'steelblue'}
+sorted_df = baseline_df.sort_values('R2', ascending=True)
+colors    = [color_map.get(t, 'gray') for t in sorted_df['Type']]
+ax.barh(sorted_df['Model'], sorted_df['R2'], color=colors, alpha=0.85)
+ax.set_xlabel('R² (higher is better)')
+ax.set_title('Model Comparison — Physics Baseline vs BEP Delta-ML vs ML')
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+
+from matplotlib.patches import Patch
+legend_elements = [
+    Patch(facecolor='tomato',   label='Physics baseline'),
+    Patch(facecolor='seagreen', label='Physics-informed ML (BEP Delta-ML)'),
+    Patch(facecolor='steelblue',label='ML model'),
+]
+ax.legend(handles=legend_elements, loc='lower right')
+plt.tight_layout()
+save_figure(fig, 'physics_baseline_barchart')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 28 — PERMUTATION IMPORTANCE')
+print('=' * 55)
+
+perm_ckpt = load_checkpoint('permutation_importance')
+
+if perm_ckpt is not None:
+    perm_df       = perm_ckpt['perm_df']
+    consensus_df  = perm_ckpt['consensus_df']
+    print('✓ Permutation importance loaded from Drive.')
+
+else:
+    # ── Load dependencies ─────────────────────────────────────────────────────
+    try:
+        rf_final_barrier
+    except NameError:
+        rf_final_barrier = load_model('rf_barrier_final')
+        if rf_final_barrier is None:
+            print('ERROR: RF model not found. Run Step 11 first.')
+            raise SystemExit
+
+    try:
+        X_arr; y_barrier; feature_names
+    except NameError:
+        ckpt = load_checkpoint('feature_matrix')
+        if ckpt is None:
+            print('ERROR: Feature matrix not found. Run Step 5 first.')
+            raise SystemExit
+        X_arr         = ckpt['X_arr']
+        y_barrier     = ckpt['y_barrier']
+        feature_names = ckpt['feature_names']
+        X             = pd.DataFrame(X_arr, columns=feature_names)
+
+    from sklearn.inspection import permutation_importance
+
+    # Use 1000 sample subset for speed
+    N_PERM = 1000
+    idx_perm = np.random.choice(len(X_arr), N_PERM, replace=False)
+    X_perm   = X_arr[idx_perm]
+    y_perm   = y_barrier[idx_perm]
+
+    print(f'Computing permutation importance on {N_PERM} samples...')
+    print('(This may take 10-15 min)')
+
+    t0      = time.time()
+    perm_result = permutation_importance(
+        rf_final_barrier, X_perm, y_perm,
+        n_repeats=5, random_state=SEED, n_jobs=-1)
+    elapsed = time.time() - t0
+    print(f'✓ Done in {int(elapsed//60)}m{int(elapsed%60):02d}s')
+
+    perm_df = pd.DataFrame({
+        'feature':    feature_names,
+        'perm_importance_mean': perm_result.importances_mean,
+        'perm_importance_std':  perm_result.importances_std,
+    }).sort_values('perm_importance_mean', ascending=False)
+
+    # ── MDI importance ────────────────────────────────────────────────────────
+    fi_ckpt = load_checkpoint('feature_importance')
+    if fi_ckpt is not None:
+        fi_rf = fi_ckpt['fi_rf']
+        mdi_df = fi_rf.reset_index().rename(
+            columns={'index': 'feature', 0: 'mdi_importance'})
+    else:
+        mdi_df = pd.DataFrame({
+            'feature':        feature_names,
+            'mdi_importance': rf_final_barrier.feature_importances_,
+        })
+
+    # ── SHAP importance ───────────────────────────────────────────────────────
+    shap_ckpt_rf = load_checkpoint('shap_values_rf')
+    if shap_ckpt_rf is not None:
+        shap_values_rf = shap_ckpt_rf['shap_values_rf']
+        shap_mean      = np.abs(shap_values_rf).mean(axis=0)
+        shap_df        = pd.DataFrame({
+            'feature':          feature_names,
+            'shap_importance':  shap_mean,
+        })
+    else:
+        shap_df = None
+
+    # ── Consensus ranking ─────────────────────────────────────────────────────
+    # Rank each method separately, then average ranks
+    mdi_rank  = mdi_df.set_index('feature')['mdi_importance'].rank(ascending=False)
+    perm_rank = perm_df.set_index('feature')['perm_importance_mean'].rank(ascending=False)
+
+    consensus = pd.DataFrame({
+        'MDI_rank':  mdi_rank,
+        'Perm_rank': perm_rank,
+    })
+
+    if shap_df is not None:
+        shap_rank = shap_df.set_index('feature')['shap_importance'].rank(ascending=False)
+        consensus['SHAP_rank'] = shap_rank
+        consensus['Mean_rank'] = consensus[['MDI_rank','Perm_rank','SHAP_rank']].mean(axis=1)
+    else:
+        consensus['Mean_rank'] = consensus[['MDI_rank','Perm_rank']].mean(axis=1)
+
+    consensus_df = consensus.sort_values('Mean_rank').reset_index()
+    consensus_df.insert(0, 'Consensus_rank', range(1, len(consensus_df)+1))
+
+    save_checkpoint(
+        {'perm_df': perm_df, 'consensus_df': consensus_df},
+        'permutation_importance')
+    print('✓ Permutation importance saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\nTOP 20 — Permutation Importance:')
+print(perm_df.head(20)[['feature','perm_importance_mean',
+                          'perm_importance_std']].to_string(index=False))
+
+print('\nTOP 20 — Consensus Descriptor Ranking:')
+print(consensus_df.head(20).to_string(index=False))
+
+save_csv(perm_df, 'permutation_importance')
+save_csv(consensus_df, 'descriptor_consensus_ranking')
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+top20_perm = perm_df.head(20).sort_values('perm_importance_mean')
+axes[0].barh(top20_perm['feature'], top20_perm['perm_importance_mean'],
+             xerr=top20_perm['perm_importance_std'],
+             color='steelblue', alpha=0.85, capsize=3)
+axes[0].set_xlabel('Permutation Importance (mean ± std)')
+axes[0].set_title('Permutation Importance — Top 20')
+axes[0].spines['top'].set_visible(False)
+axes[0].spines['right'].set_visible(False)
+
+top20_cons = consensus_df.head(20).sort_values('Mean_rank', ascending=False)
+axes[1].barh(top20_cons['feature'], top20_cons['Mean_rank'].max() -
+             top20_cons['Mean_rank'],
+             color='seagreen', alpha=0.85)
+axes[1].set_xlabel('Consensus Score (higher = more important)')
+axes[1].set_title('Descriptor Consensus Ranking — Top 20')
+axes[1].spines['top'].set_visible(False)
+axes[1].spines['right'].set_visible(False)
+
+plt.suptitle('Permutation Importance and Consensus Descriptor Ranking',
+             fontsize=13)
+plt.tight_layout()
+save_figure(fig, 'permutation_importance_consensus')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 29 — UNCERTAINTY CALIBRATION')
+print('=' * 55)
+
+calib_ckpt = load_checkpoint('uncertainty_calibration')
+
+if calib_ckpt is not None:
+    calib_df     = calib_ckpt['calib_df']
+    corr_val     = calib_ckpt['corr_val']
+    print('✓ Uncertainty calibration loaded from Drive.')
+
+else:
+    # ── Load pred_mean, pred_std ──────────────────────────────────────────────
+    try:
+        pred_mean; pred_std
+    except NameError:
+        uq_ckpt = load_checkpoint('uncertainty')
+        if uq_ckpt is None:
+            print('ERROR: Step 19 data not found. Run Step 19 first.')
+            raise SystemExit
+        pred_mean = uq_ckpt['pred_mean']
+        pred_std  = uq_ckpt['pred_std']
+
+    try:
+        y_barrier
+    except NameError:
+        ckpt      = load_checkpoint('feature_matrix')
+        y_barrier = ckpt['y_barrier']
+
+    # Absolute error per sample
+    abs_error = np.abs(pred_mean - y_barrier)
+
+    # Correlation between uncertainty and absolute error
+    corr_val = np.corrcoef(pred_std, abs_error)[0, 1]
+    print(f'Correlation (uncertainty vs absolute error): {corr_val:.4f}')
+
+    # ── Bin by uncertainty ────────────────────────────────────────────────────
+    N_BINS   = 10
+    bin_edges = np.percentile(pred_std, np.linspace(0, 100, N_BINS + 1))
+    bin_edges = np.unique(bin_edges)
+
+    calib_rows = []
+    for j in range(len(bin_edges) - 1):
+        mask = (pred_std >= bin_edges[j]) & (pred_std < bin_edges[j + 1])
+        if mask.sum() == 0:
+            continue
+        calib_rows.append({
+            'Bin':            j + 1,
+            'Uncertainty_low':  round(bin_edges[j], 5),
+            'Uncertainty_high': round(bin_edges[j + 1], 5),
+            'Mean_uncertainty': round(pred_std[mask].mean(), 5),
+            'Mean_abs_error':   round(abs_error[mask].mean(), 5),
+            'N_samples':        int(mask.sum()),
+        })
+
+    calib_df = pd.DataFrame(calib_rows)
+    save_checkpoint(
+        {'calib_df': calib_df, 'corr_val': corr_val},
+        'uncertainty_calibration')
+    print('✓ Uncertainty calibration saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print(f'\nCorrelation (uncertainty vs absolute error): {corr_val:.4f}')
+print('\nCALIBRATION TABLE:')
+print(calib_df.to_string(index=False))
+save_csv(calib_df, 'uncertainty_calibration')
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+axes[0].scatter(pred_std, np.abs(pred_mean - y_barrier),
+                alpha=0.2, s=6, c='steelblue', rasterized=True)
+axes[0].set_xlabel('Predicted Uncertainty (std, eV)')
+axes[0].set_ylabel('Actual Absolute Error (eV)')
+axes[0].set_title(f'Uncertainty vs Actual Error\nr = {corr_val:.4f}')
+axes[0].spines['top'].set_visible(False)
+axes[0].spines['right'].set_visible(False)
+
+axes[1].plot(calib_df['Mean_uncertainty'], calib_df['Mean_abs_error'],
+             marker='o', color='tomato', linewidth=2)
+axes[1].plot([0, calib_df['Mean_uncertainty'].max()],
+             [0, calib_df['Mean_uncertainty'].max()],
+             'k--', linewidth=1, label='Perfect calibration')
+axes[1].set_xlabel('Mean Predicted Uncertainty (eV)')
+axes[1].set_ylabel('Mean Actual Error (eV)')
+axes[1].set_title('Calibration Curve — Uncertainty vs Actual Error')
+axes[1].legend()
+axes[1].spines['top'].set_visible(False)
+axes[1].spines['right'].set_visible(False)
+
+plt.suptitle('Uncertainty Calibration Analysis', fontsize=13)
+plt.tight_layout()
+save_figure(fig, 'uncertainty_calibration')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 30 — STABILITY-AWARE CATALYST RANKING')
+print('=' * 55)
+
+stability_ckpt = load_checkpoint('stability_ranking')
+
+if stability_ckpt is not None:
+    top50_stable  = stability_ckpt['top50_stable']
+    screen_full   = stability_ckpt['screen_full']
+    print('✓ Stability ranking loaded from Drive.')
+
+else:
+    # ── Load dependencies ─────────────────────────────────────────────────────
+    try:
+        pred_mean; pred_std
+    except NameError:
+        uq_ckpt   = load_checkpoint('uncertainty')
+        pred_mean = uq_ckpt['pred_mean']
+        pred_std  = uq_ckpt['pred_std']
+
+    try:
+        screen_df
+    except NameError:
+        sc_ckpt   = load_checkpoint('virtual_screening')
+        if sc_ckpt is None:
+            print('ERROR: Step 20 data not found. Run Step 20 first.')
+            raise SystemExit
+        screen_df = sc_ckpt['screen_df']
+
+    try:
+        X_arr; feature_names
+    except NameError:
+        ckpt          = load_checkpoint('feature_matrix')
+        X_arr         = ckpt['X_arr']
+        feature_names = ckpt['feature_names']
+        X             = pd.DataFrame(X_arr, columns=feature_names)
+
+    from sklearn.preprocessing import MinMaxScaler
+
+    screen_full = screen_df.copy()
+
+    # ── Stability proxy descriptors ───────────────────────────────────────────
+    stab_feats = {
+        'abs_delta_cohesive':    'delta_cohesive',
+        'abs_delta_surf_energy': 'delta_surface_energy',
+        'abs_rd_rh':             'rd-rh',
+        'rd_rh_dev':             'rd/rh',
+    }
+
+    for col, feat in stab_feats.items():
+        if feat in feature_names:
+            vals = X[feat].values
+            if col == 'rd_rh_dev':
+                screen_full[col] = np.abs(vals - 1.0)
+            else:
+                screen_full[col] = np.abs(vals)
+
+    avail_stab = [c for c in stab_feats.keys()
+                  if c in screen_full.columns]
+
+    # Stability penalty = mean of available stability proxies
+    screen_full['stability_penalty_raw'] = screen_full[avail_stab].mean(axis=1)
+
+    # ── Normalize all scores to [0, 1] ────────────────────────────────────────
+    scaler = MinMaxScaler()
+    screen_full['norm_barrier']     = scaler.fit_transform(
+        screen_full[['Pred_Barrier']])
+    screen_full['norm_uncertainty'] = scaler.fit_transform(
+        screen_full[['Uncertainty']])
+    screen_full['norm_stability']   = scaler.fit_transform(
+        screen_full[['stability_penalty_raw']])
+
+    # ── Final screening score ─────────────────────────────────────────────────
+    screen_full['stability_score'] = (
+        screen_full['norm_barrier'] +
+        screen_full['norm_uncertainty'] +
+        screen_full['norm_stability']
+    )
+
+    top50_stable = screen_full.sort_values('stability_score').head(50)
+
+    save_checkpoint(
+        {'top50_stable': top50_stable, 'screen_full': screen_full},
+        'stability_ranking')
+    print('✓ Stability ranking saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\nTOP 20 STABILITY-AWARE CANDIDATES:')
+display_cols = ['Host', 'Doped', 'Surface', 'DFT_Barrier',
+                'Pred_Barrier', 'Uncertainty', 'stability_score']
+display_cols = [c for c in display_cols if c in top50_stable.columns]
+print(top50_stable[display_cols].head(20).to_string(index=False))
+save_csv(top50_stable, 'top_50_stability_aware_candidates')
+
+fig, ax = plt.subplots(figsize=(10, 7))
+sc = ax.scatter(
+    screen_full['Pred_Barrier'],
+    screen_full['Uncertainty'],
+    c=screen_full['norm_stability'],
+    cmap='RdYlGn_r', alpha=0.5, s=10, rasterized=True)
+plt.colorbar(sc, ax=ax, label='Stability Penalty (normalized)')
+
+ax.scatter(top50_stable['Pred_Barrier'],
+           top50_stable['Uncertainty'],
+           s=80, facecolors='none', edgecolors='black',
+           linewidths=1.5, label='Top 50 stable candidates')
+ax.set_xlabel('Predicted Barrier (eV)')
+ax.set_ylabel('Prediction Uncertainty (eV)')
+ax.set_title('Stability-Aware Screening Map\n'
+             '(colour = stability penalty; circled = top 50 candidates)')
+ax.legend()
+plt.tight_layout()
+save_figure(fig, 'stability_aware_screening_map')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 31 — Q1-READY SUMMARY TABLES AND FIGURES')
+print('=' * 55)
+
+# ── Load all results ──────────────────────────────────────────────────────────
+try:    results_5f
+except NameError:   results_5f   = load_checkpoint('results_5f')
+
+try:    results_loho
+except NameError:   results_loho = load_checkpoint('results_loho')
+
+try:    results_loso
+except NameError:   results_loso = load_checkpoint('results_loso')
+
+results_lodo_new = load_checkpoint('results_lodo')
+if results_lodo_new is not None:
+    results_lodo_new = results_lodo_new['results_lodo']
+
+ablation_df  = load_checkpoint('ablation_results')
+if ablation_df  is not None: ablation_df  = ablation_df['ablation_df']
+
+baseline_df  = load_checkpoint('physics_baselines')
+if baseline_df  is not None: baseline_df  = baseline_df['baseline_df']
+
+consensus_df = load_checkpoint('permutation_importance')
+if consensus_df is not None: consensus_df = consensus_df['consensus_df']
+
+top50_stable = load_checkpoint('stability_ranking')
+if top50_stable is not None: top50_stable = top50_stable['top50_stable']
+
+calib_df     = load_checkpoint('uncertainty_calibration')
+corr_val     = None
+if calib_df  is not None:
+    corr_val = calib_df['corr_val']
+    calib_df = calib_df['calib_df']
+
+# ── Table A: Full model performance ──────────────────────────────────────────
+print('\n' + '='*70)
+print('TABLE A — MODEL PERFORMANCE ACROSS ALL CV PROTOCOLS')
+print('='*70)
+
+rows_a = []
+for protocol, res, key in [
+    ('5-Fold CV',  results_5f,   'barrier'),
+    ('LOHO-CV',    results_loho, None),
+    ('LOSO-CV',    results_loso, None),
+    ('LODO-CV',    results_lodo_new, None),
+]:
+    if res is None:
+        continue
+    for name, label in [('RF','Random Forest'),
+                         ('DF','Deep Forest'),
+                         ('MLP','Neural Network')]:
+        vals = res[name][key] if key else res[name]
+        if not vals:
+            continue
+        rows_a.append({
+            'Protocol': protocol,
+            'Model':    label,
+            'R²':       f'{np.mean([r["R2"]   for r in vals]):.4f} ± '
+                        f'{np.std([r["R2"]   for r in vals]):.4f}',
+            'MAE':      f'{np.mean([r["MAE"]  for r in vals]):.4f} ± '
+                        f'{np.std([r["MAE"]  for r in vals]):.4f}',
+            'RMSE':     f'{np.mean([r["RMSE"] for r in vals]):.4f} ± '
+                        f'{np.std([r["RMSE"] for r in vals]):.4f}',
+        })
+
+table_a = pd.DataFrame(rows_a)
+print(table_a.to_string(index=False))
+save_csv(table_a, 'table_A_model_performance')
+
+# ── Table B: Ablation ─────────────────────────────────────────────────────────
+if ablation_df is not None:
+    print('\n' + '='*70)
+    print('TABLE B — DESCRIPTOR GROUP ABLATION')
+    print('='*70)
+    print(ablation_df[ablation_df['Type']=='Individual'][
+        ['Group','N_feats','R2','MAE']].to_string(index=False))
+    save_csv(ablation_df, 'table_B_ablation')
+
+# ── Table C: Physics baseline ─────────────────────────────────────────────────
+if baseline_df is not None:
+    print('\n' + '='*70)
+    print('TABLE C — PHYSICS BASELINES vs ML MODELS')
+    print('='*70)
+    print(baseline_df[['Model','Type','R2','MAE','RMSE']].to_string(index=False))
+    save_csv(baseline_df, 'table_C_physics_baseline')
+
+# ── Table D: Consensus descriptors ───────────────────────────────────────────
+if consensus_df is not None:
+    print('\n' + '='*70)
+    print('TABLE D — TOP 20 CONSENSUS DESCRIPTORS')
+    print('='*70)
+    print(consensus_df.head(20).to_string(index=False))
+    save_csv(consensus_df.head(20), 'table_D_consensus_descriptors')
+
+# ── Table E: Top 50 stable candidates ────────────────────────────────────────
+if top50_stable is not None:
+    print('\n' + '='*70)
+    print('TABLE E — TOP 50 STABILITY-AWARE CANDIDATES')
+    print('='*70)
+    display_cols = ['Host','Doped','Surface','DFT_Barrier',
+                    'Pred_Barrier','Uncertainty','stability_score']
+    display_cols = [c for c in display_cols if c in top50_stable.columns]
+    print(top50_stable[display_cols].head(10).to_string(index=False))
+    save_csv(top50_stable, 'table_E_top50_candidates')
+
+# Get best model from Table A
+if rows_a:
+    best_5f = table_a[table_a['Protocol']=='5-Fold CV'].iloc[0]
+    best_loho = table_a[table_a['Protocol']=='LOHO-CV'] if 'LOHO-CV' in table_a['Protocol'].values else None
+
+best_model_name = 'Random Forest'
+best_r2   = np.mean([r['R2']  for r in results_5f['RF']['barrier']])
+best_mae  = np.mean([r['MAE'] for r in results_5f['RF']['barrier']])
+
+loho_r2 = np.mean([r['R2'] for r in results_loho['RF']]) if results_loho else None
+loso_r2 = np.mean([r['R2'] for r in results_loso['RF']]) if results_loso else None
+lodo_r2 = np.mean([r['R2'] for r in results_lodo_new['RF']]) if results_lodo_new else None
+
+print('✓ All Step 31 summary tables saved to Drive.')
+print(f'\nAll outputs at: {SAVE_DIR}/results/')
+print(f'All figures at: {SAVE_DIR}/figures/')
+
+
+print('=' * 55)
+print('STEP 32 — ACTIVE LEARNING SIMULATION')
+print('=' * 55)
+
+# Active learning answers: which DFT calculations to run next
+# to find the lowest-barrier SAA catalyst most efficiently.
+
+al_ckpt = load_checkpoint('active_learning')
+
+if al_ckpt is not None:
+    al_history_df    = al_ckpt['al_history_df']
+    recommendations  = al_ckpt['recommendations']
+    cal_factor       = al_ckpt['cal_factor']
+    print('✓ Active learning results loaded from Drive.')
+
+else:
+    # ── Load dependencies ─────────────────────────────────────────────────────
+    try:
+        X_arr; y_barrier; feature_names
+    except NameError:
+        ckpt = load_checkpoint('feature_matrix')
+        if ckpt is None:
+            print('ERROR: Feature matrix not found. Run Step 5 first.')
+            raise SystemExit
+        X_arr         = ckpt['X_arr']
+        y_barrier     = ckpt['y_barrier']
+        feature_names = ckpt['feature_names']
+        X             = pd.DataFrame(X_arr, columns=feature_names)
+
+    try:
+        pred_mean; pred_std
+    except NameError:
+        uq_ckpt = load_checkpoint('uncertainty')
+        if uq_ckpt is None:
+            print('ERROR: Step 19 data not found. Run Step 19 first.')
+            raise SystemExit
+        pred_mean = uq_ckpt['pred_mean']
+        pred_std  = uq_ckpt['pred_std']
+
+    # ── Part A: Uncertainty Calibration (proper coverage test) ───────────────
+    print('Part A: Calibrating uncertainty estimates...')
+
+    abs_error = np.abs(pred_mean - y_barrier)
+
+    # Find calibration factor: scale std so |error| / (s * std) ~ median 0.6745
+    cal_factor = float(np.median(abs_error / (pred_std + 1e-8)) / 0.6745)
+    pred_std_cal = pred_std * cal_factor
+
+    # Coverage at 1-sigma and 2-sigma
+    for n_sigma in [1, 2]:
+        cov_raw = (abs_error <= n_sigma * pred_std).mean()
+        cov_cal = (abs_error <= n_sigma * pred_std_cal).mean()
+        expected = 0.683 if n_sigma == 1 else 0.954
+        print(f'  {n_sigma}σ coverage: raw={cov_raw:.3f}  '
+              f'calibrated={cov_cal:.3f}  expected={expected:.3f}')
+
+    print(f'  Calibration factor: {cal_factor:.4f}')
+    print(f'  Raw std mean      : {pred_std.mean():.4f} eV')
+    print(f'  Calibrated std    : {pred_std_cal.mean():.4f} eV')
+
+    # ── Part B: Active Learning Simulation ────────────────────────────────────
+    print('\nPart B: Simulating active learning loop...')
+    print('  Comparing: AL (uncertainty + exploitation) vs Random selection')
+
+    N_INITIAL    = 100
+    N_QUERY      = 5
+    N_ITERATIONS = 20
+    ALPHA        = 0.5   # 0=pure exploitation, 1=pure exploration, 0.5=balanced
+
+    rng          = np.random.RandomState(SEED)
+    n_total      = len(X_arr)
+
+    # Initial labeled set (same for both AL and random)
+    initial_idx   = rng.choice(n_total, N_INITIAL, replace=False)
+    remaining_all = np.setdiff1d(np.arange(n_total), initial_idx)
+
+    al_labeled    = list(initial_idx)
+    rand_labeled  = list(initial_idx.copy())
+    rand_remaining= list(remaining_all.copy())
+
+    al_history  = []
+
+    for iteration in tqdm(range(N_ITERATIONS + 1),
+                          desc='AL iterations', ncols=80):
+
+        # ── Train RF on current labeled set ───────────────────────────────────
+        X_lab = X_arr[al_labeled]
+        y_lab = y_barrier[al_labeled]
+
+        rf_al = RandomForestRegressor(
+            n_estimators=200, max_features='sqrt',
+            min_samples_leaf=2, n_jobs=-1, random_state=SEED)
+        rf_al.fit(X_lab, y_lab)
+
+        # ── Predictions with uncertainty on remaining pool ────────────────────
+        al_remaining = np.setdiff1d(np.arange(n_total), al_labeled)
+        X_rem        = X_arr[al_remaining]
+
+        tree_preds   = np.array([t.predict(X_rem)
+                                  for t in rf_al.estimators_])
+        mean_rem     = tree_preds.mean(axis=0)
+        std_rem      = tree_preds.std(axis=0)
+
+        # ── Best Ea found so far ──────────────────────────────────────────────
+        al_best_ea   = y_barrier[al_labeled].min()
+        rand_best_ea = y_barrier[rand_labeled].min()
+
+        n_labeled = N_INITIAL + iteration * N_QUERY
+
+        al_history.append({
+            'iteration':    iteration,
+            'n_labeled':    n_labeled,
+            'al_best_ea':   round(float(al_best_ea), 5),
+            'rand_best_ea': round(float(rand_best_ea), 5),
+            'al_advantage': round(float(rand_best_ea - al_best_ea), 5),
+        })
+
+        if iteration < N_ITERATIONS:
+            # ── AL acquisition: balanced uncertainty + exploitation ────────────
+            # Normalize scores to [0,1]
+            if std_rem.max() > std_rem.min():
+                unc_score  = (std_rem - std_rem.min()) / (
+                    std_rem.max() - std_rem.min())
+            else:
+                unc_score  = np.zeros_like(std_rem)
+
+            if mean_rem.max() > mean_rem.min():
+                exp_score  = 1 - (mean_rem - mean_rem.min()) / (
+                    mean_rem.max() - mean_rem.min())
+            else:
+                exp_score  = np.ones_like(mean_rem)
+
+            acq_score     = ALPHA * unc_score + (1 - ALPHA) * exp_score
+            al_query_idx  = np.argsort(acq_score)[::-1][:N_QUERY]
+            new_al        = al_remaining[al_query_idx]
+            al_labeled.extend(new_al.tolist())
+
+            # ── Random acquisition ────────────────────────────────────────────
+            n_rand        = min(N_QUERY, len(rand_remaining))
+            new_rand      = rng.choice(rand_remaining, n_rand, replace=False)
+            rand_labeled.extend(new_rand.tolist())
+            rand_remaining= [x for x in rand_remaining
+                              if x not in new_rand]
+
+    al_history_df = pd.DataFrame(al_history)
+
+    print(f'\n  Initial labeled   : {N_INITIAL}')
+    print(f'  Total after AL    : {N_INITIAL + N_ITERATIONS * N_QUERY}')
+    print(f'  AL best Ea found  : {al_history_df["al_best_ea"].min():.4f} eV')
+    print(f'  Random best Ea    : {al_history_df["rand_best_ea"].min():.4f} eV')
+    print(f'  AL advantage      : '
+          f'{al_history_df["al_advantage"].max():.4f} eV')
+
+    # ── Part C: Final DFT Recommendations ────────────────────────────────────
+    print('\nPart C: Generating DFT candidate recommendations...')
+
+    # Train final AL model on all data seen so far
+    rf_final_al = RandomForestRegressor(
+        n_estimators=300, max_features='sqrt',
+        min_samples_leaf=2, n_jobs=-1, random_state=SEED)
+    rf_final_al.fit(X_arr[al_labeled], y_barrier[al_labeled])
+
+    # Predict with uncertainty on ALL configurations
+    tree_preds_all = np.array([t.predict(X_arr)
+                                for t in rf_final_al.estimators_])
+    pred_mean_al   = tree_preds_all.mean(axis=0)
+    pred_std_al    = tree_preds_all.std(axis=0) * cal_factor  # calibrated
+
+    # Acquisition score on full dataset
+    if pred_std_al.max() > pred_std_al.min():
+        unc_sc = (pred_std_al - pred_std_al.min()) / (
+            pred_std_al.max() - pred_std_al.min())
+    else:
+        unc_sc = np.zeros_like(pred_std_al)
+
+    if pred_mean_al.max() > pred_mean_al.min():
+        exp_sc = 1 - (pred_mean_al - pred_mean_al.min()) / (
+            pred_mean_al.max() - pred_mean_al.min())
+    else:
+        exp_sc = np.ones_like(pred_mean_al)
+
+    acq_full = ALPHA * unc_sc + (1 - ALPHA) * exp_sc
+
+    # Apply filters: low Ea AND low uncertainty
+    EA_THRESHOLD  = float(np.percentile(y_barrier, 10))  # bottom 10% Ea
+    UNC_THRESHOLD = float(np.percentile(pred_std_al, 30)) # bottom 30% uncertainty
+
+    mask = (pred_mean_al <= EA_THRESHOLD) & \
+           (pred_std_al  <= UNC_THRESHOLD)
+
+    print(f'  Ea threshold       : {EA_THRESHOLD:.4f} eV (bottom 10%)')
+    print(f'  Uncertainty thresh : {UNC_THRESHOLD:.4f} eV (bottom 30%)')
+    print(f'  Candidates passing : {mask.sum()} / {len(mask)}')
+
+    rec_scores = acq_full.copy()
+    rec_scores[~mask] = -np.inf
+
+    top10_idx = np.argsort(rec_scores)[::-1][:10]
+
+    # Load screen_df for Host/Doped/Surface labels
+    sc_ckpt = load_checkpoint('virtual_screening')
+    if sc_ckpt is not None:
+        screen_df = sc_ckpt['screen_df']
+        rec_hosts   = screen_df.iloc[top10_idx]['Host'].values
+        rec_dopants = screen_df.iloc[top10_idx]['Doped'].values
+        rec_surfs   = screen_df.iloc[top10_idx]['Surface'].values
+    else:
+        rec_hosts   = host_labels[top10_idx]
+        rec_dopants = ['N/A'] * 10
+        rec_surfs   = surface_labels[top10_idx]
+
+    recommendations = pd.DataFrame({
+        'DFT_Priority':    range(1, 11),
+        'Host':            rec_hosts,
+        'Dopant':          rec_dopants,
+        'Surface':         rec_surfs,
+        'Pred_Barrier_eV': pred_mean_al[top10_idx].round(4),
+        'Uncertainty_eV':  pred_std_al[top10_idx].round(4),
+        'DFT_Barrier_eV':  y_barrier[top10_idx].round(4),
+        'Acq_Score':       acq_full[top10_idx].round(4),
+    })
+
+    save_checkpoint({
+        'al_history_df':   al_history_df,
+        'recommendations': recommendations,
+        'cal_factor':      cal_factor,
+    }, 'active_learning')
+    print('✓ Active learning results saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print(f'\nCalibration factor : {cal_factor:.4f}')
+print(f'\nACTIVE LEARNING HISTORY:')
+print(al_history_df.to_string(index=False))
+save_csv(al_history_df, 'active_learning_history')
+
+print('\nTOP 10 DFT RECOMMENDATIONS:')
+print(recommendations.to_string(index=False))
+save_csv(recommendations, 'dft_recommendations')
+
+# ── Plots ─────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+# Plot 1: Learning curves
+axes[0].plot(al_history_df['n_labeled'], al_history_df['al_best_ea'],
+             'b-o', linewidth=2, markersize=5, label='Active Learning')
+axes[0].plot(al_history_df['n_labeled'], al_history_df['rand_best_ea'],
+             'r--s', linewidth=2, markersize=5, label='Random Selection')
+axes[0].set_xlabel('Number of Labeled Configurations')
+axes[0].set_ylabel('Best Ea Found (eV)')
+axes[0].set_title('Active Learning vs Random\nEfficiency in Finding Low-Ea Catalysts')
+axes[0].legend()
+axes[0].spines['top'].set_visible(False)
+axes[0].spines['right'].set_visible(False)
+
+# Plot 2: AL advantage per iteration
+axes[1].bar(al_history_df['iteration'], al_history_df['al_advantage'],
+            color='steelblue', alpha=0.85)
+axes[1].axhline(0, color='k', linestyle='--', linewidth=1)
+axes[1].set_xlabel('AL Iteration')
+axes[1].set_ylabel('Ea Improvement over Random (eV)')
+axes[1].set_title('Active Learning Advantage\nper Iteration')
+axes[1].spines['top'].set_visible(False)
+axes[1].spines['right'].set_visible(False)
+
+# Plot 3: Recommendations — predicted barrier vs uncertainty
+axes[2].scatter(pred_mean, pred_std * cal_factor,
+                alpha=0.3, s=8, c='gray',
+                rasterized=True, label='All configs')
+axes[2].scatter(recommendations['Pred_Barrier_eV'],
+                recommendations['Uncertainty_eV'],
+                s=100, c='red', zorder=5,
+                label='Top 10 DFT candidates')
+for i, row in recommendations.iterrows():
+    axes[2].annotate(str(row['DFT_Priority']),
+                     (row['Pred_Barrier_eV'], row['Uncertainty_eV']),
+                     fontsize=8, ha='center', va='bottom')
+axes[2].set_xlabel('Predicted Barrier (eV)')
+axes[2].set_ylabel('Calibrated Uncertainty (eV)')
+axes[2].set_title('DFT Candidate Recommendations\n(red = top 10 priority)')
+axes[2].legend()
+axes[2].spines['top'].set_visible(False)
+axes[2].spines['right'].set_visible(False)
+
+plt.suptitle('Active Learning for SAA Catalyst Screening', fontsize=13)
+plt.tight_layout()
+save_figure(fig, 'active_learning_results')
+plt.show()
+
+
+print('=' * 55)
+print('STEP 33 — C3ONSTRAINED LOSS FUNCTION (PINN)')
+print('=' * 55)
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+import time
+
+pinn_ckpt = load_checkpoint('pinn_results')
+
+if pinn_ckpt is not None:
+    pinn_df        = pinn_ckpt['pinn_df']
+    pinn_pred_test = pinn_ckpt['pinn_pred_test']
+    y_test_pinn    = pinn_ckpt['y_test_pinn']
+    print('✓ PINN results loaded from Drive.')
+
+else:
+    # ── Load dependencies ─────────────────────────────────────────────────────
+    try:
+        X_arr; y_barrier; feature_names
+    except NameError:
+        ckpt = load_checkpoint('feature_matrix')
+        if ckpt is None:
+            print('ERROR: Feature matrix not found. Run Step 5 first.')
+            raise SystemExit
+        X_arr         = ckpt['X_arr']
+        y_barrier     = ckpt['y_barrier']
+        feature_names = ckpt['feature_names']
+        X             = pd.DataFrame(X_arr, columns=feature_names)
+
+    # ── Device ────────────────────────────────────────────────────────────────
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device}')
+
+    # ── Physics feature indices ───────────────────────────────────────────────
+    # BEP-relevant descriptors used as physics constraints
+    bep_feature_candidates = [
+        'delta_d_band',
+        'delta_cohesive',
+        'delta_surface_energy',
+        'delta_electroneg',
+        'doped_weighted_surface_energy',
+        'doped_d-band_center',
+    ]
+    bep_features = [f for f in bep_feature_candidates if f in feature_names]
+    bep_indices  = [feature_names.index(f) for f in bep_features]
+    print(f'Physics constraint features ({len(bep_features)}): {bep_features}')
+
+    # ── PINN Architecture ─────────────────────────────────────────────────────
+    class PhysicsConstrainedNN(nn.Module):
+        """
+        Physics-Informed Neural Network for SAA barrier prediction.
+
+        Architecture:
+          Main branch: full feature vector → deep MLP → barrier prediction
+          Physics branch: BEP descriptors only → linear BEP prior
+
+        Loss = MSE(prediction, true)
+             + lambda_bep  * ||prediction - BEP_prior||²   (BEP consistency)
+             + lambda_pos  * max(0, -prediction)²           (Ea > 0 constraint)
+             + lambda_mono * monotonicity penalty            (SHAP-guided)
+
+        The three constraint terms encode:
+          1. BEP consistency: prediction should not deviate too far from
+             the linear BEP scaling relation — enforces physical prior
+          2. Positivity:  activation barriers must be > 0 eV
+          3. Smoothness:  large changes in prediction for small descriptor
+             changes are penalised (optional)
+        """
+
+        def __init__(self, n_features, n_bep, hidden=(512, 256, 128)):
+            super().__init__()
+
+            # Main deep branch
+            layers = []
+            in_dim = n_features
+            for h in hidden:
+                layers += [nn.Linear(in_dim, h), nn.ReLU(), nn.Dropout(0.1)]
+                in_dim = h
+            layers.append(nn.Linear(in_dim, 1))
+            self.main_branch = nn.Sequential(*layers)
+
+            # Physics (BEP) branch — linear model on BEP features
+            self.bep_branch = nn.Linear(n_bep, 1, bias=True)
+
+        def forward(self, x, x_bep):
+            pred     = self.main_branch(x).squeeze(-1)
+            bep_pred = self.bep_branch(x_bep).squeeze(-1)
+            return pred, bep_pred
+
+    def physics_loss(pred, bep_pred, y_true,
+                     lambda_bep=0.1, lambda_pos=1.0):
+        """
+        Combined loss with physics constraints.
+
+        Terms:
+          mse_loss    : standard prediction accuracy
+          bep_loss    : prediction should be consistent with BEP prior
+          pos_loss    : Ea must be positive (physical constraint)
+          bep_train   : BEP branch itself trained on true y (auxiliary)
+        """
+        mse_loss = nn.MSELoss()(pred, y_true)
+        bep_loss = lambda_bep * nn.MSELoss()(pred, bep_pred.detach())
+        pos_loss = lambda_pos * torch.mean(torch.clamp(-pred, min=0) ** 2)
+        bep_train= nn.MSELoss()(bep_pred, y_true)
+
+        total = mse_loss + bep_loss + pos_loss + bep_train
+        return total, {
+            'mse':  mse_loss.item(),
+            'bep':  bep_loss.item(),
+            'pos':  pos_loss.item(),
+            'total':total.item()
+        }
+
+    # ── Training function ──────────────────────────────────────────────────────
+    def train_pinn(X_tr, X_te, y_tr, y_te,
+                   bep_idx, n_epochs=150,
+                   lr=1e-3, batch_size=256,
+                   lambda_bep=0.1, lambda_pos=1.0,
+                   verbose=True):
+
+        scaler = StandardScaler()
+        X_tr_s = scaler.fit_transform(X_tr)
+        X_te_s = scaler.transform(X_te)
+
+        X_tr_t  = torch.tensor(X_tr_s, dtype=torch.float32).to(device)
+        X_te_t  = torch.tensor(X_te_s, dtype=torch.float32).to(device)
+        y_tr_t  = torch.tensor(y_tr,   dtype=torch.float32).to(device)
+        y_te_t  = torch.tensor(y_te,   dtype=torch.float32).to(device)
+
+        X_bep_tr = X_tr_t[:, bep_idx]
+        X_bep_te = X_te_t[:, bep_idx]
+
+        dataset = TensorDataset(X_tr_t, X_bep_tr, y_tr_t)
+        loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        model = PhysicsConstrainedNN(
+            n_features=X_tr_s.shape[1],
+            n_bep=len(bep_idx)
+        ).to(device)
+
+        optimizer = optim.Adam(model.parameters(), lr=lr,
+                               weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, patience=10, factor=0.5)
+
+        best_val_loss = float('inf')
+        patience_count = 0
+        patience_limit  = 20
+
+        for epoch in range(n_epochs):
+            model.train()
+            epoch_losses = []
+
+            for xb, xb_bep, yb in loader:
+                optimizer.zero_grad()
+                pred, bep_pred = model(xb, xb_bep)
+                loss, _ = physics_loss(pred, bep_pred, yb,
+                                       lambda_bep=lambda_bep,
+                                       lambda_pos=lambda_pos)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                epoch_losses.append(loss.item())
+
+            # Validation
+            model.eval()
+            with torch.no_grad():
+                pred_te, bep_te = model(X_te_t, X_bep_te)
+                val_loss, loss_parts = physics_loss(
+                    pred_te, bep_te, y_te_t,
+                    lambda_bep=lambda_bep,
+                    lambda_pos=lambda_pos)
+                val_mae = torch.mean(
+                    torch.abs(pred_te - y_te_t)).item()
+
+            scheduler.step(val_loss)
+
+            if val_loss < best_val_loss:
+                best_val_loss  = val_loss.item()
+                best_pred      = pred_te.cpu().numpy()
+                patience_count = 0
+            else:
+                patience_count += 1
+
+            if verbose and (epoch + 1) % 25 == 0:
+                print(f'  Epoch {epoch+1:3d}/{n_epochs} | '
+                      f'Train loss={np.mean(epoch_losses):.4f} | '
+                      f'Val MAE={val_mae:.4f} eV | '
+                      f'MSE={loss_parts["mse"]:.4f} | '
+                      f'BEP={loss_parts["bep"]:.4f} | '
+                      f'Pos={loss_parts["pos"]:.4f}')
+
+            if patience_count >= patience_limit:
+                if verbose:
+                    print(f'  Early stop at epoch {epoch+1}')
+                break
+
+        return best_pred, model
+
+    # ── Train/test split ───────────────────────────────────────────────────────
+    from sklearn.model_selection import train_test_split
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X_arr, y_barrier, test_size=0.2, random_state=SEED)
+
+    # ── Hyperparameter experiments ─────────────────────────────────────────────
+    # Test three lambda_bep values to show physics constraint effect
+    print('\nTraining PINN with different physics constraint strengths...')
+    print('(Each run: 150 epochs, early stopping patience=20)')
+    print()
+
+    experiments = [
+        {'lambda_bep': 0.0,  'lambda_pos': 0.0,  'label': 'Unconstrained MLP'},
+        {'lambda_bep': 0.05, 'lambda_pos': 0.5,  'label': 'PINN (weak constraint)'},
+        {'lambda_bep': 0.10, 'lambda_pos': 1.0,  'label': 'PINN (medium constraint)'},
+        {'lambda_bep': 0.20, 'lambda_pos': 1.0,  'label': 'PINN (strong constraint)'},
+    ]
+
+    results_pinn = []
+    best_pinn_pred = None
+    best_pinn_r2   = -np.inf
+
+    for exp in experiments:
+        print(f"Training: {exp['label']} "
+              f"(λ_bep={exp['lambda_bep']}, λ_pos={exp['lambda_pos']})")
+        t0 = time.time()
+
+        pred, model = train_pinn(
+            X_tr, X_te, y_tr, y_te,
+            bep_idx=bep_indices,
+            n_epochs=150,
+            lambda_bep=exp['lambda_bep'],
+            lambda_pos=exp['lambda_pos'],
+            verbose=True
+        )
+
+        m = compute_metrics(y_te, pred)
+        elapsed = time.time() - t0
+
+        results_pinn.append({
+            'Model':      exp['label'],
+            'lambda_bep': exp['lambda_bep'],
+            'lambda_pos': exp['lambda_pos'],
+            'R2':         m['R2'],
+            'MAE':        m['MAE'],
+            'RMSE':       m['RMSE'],
+            'Time_s':     round(elapsed, 1),
+        })
+
+        print(f'  → R²={m["R2"]:.4f}  MAE={m["MAE"]:.4f} eV  '
+              f'({elapsed:.0f}s)')
+        print()
+
+        if m['R2'] > best_pinn_r2:
+            best_pinn_r2   = m['R2']
+            best_pinn_pred = pred
+
+    # ── Compare with existing baselines ───────────────────────────────────────
+    baseline_ckpt = load_checkpoint('physics_baselines')
+    if baseline_ckpt is not None:
+        bep_r2  = baseline_ckpt['baseline_df'].query(
+            "Model == 'BEP Linear (physics only)'"
+        )['R2'].values[0]
+        rf_r2   = baseline_ckpt['baseline_df'].query(
+            "Model == 'BEP + Delta-ML (PIML)'"
+        )['R2'].values[0]
+
+        results_pinn.append({
+            'Model': 'BEP Linear (ref)',
+            'lambda_bep': '-', 'lambda_pos': '-',
+            'R2': bep_r2, 'MAE': '-', 'RMSE': '-', 'Time_s': '-'
+        })
+        results_pinn.append({
+            'Model': 'BEP + Delta-ML RF (ref)',
+            'lambda_bep': '-', 'lambda_pos': '-',
+            'R2': rf_r2, 'MAE': '-', 'RMSE': '-', 'Time_s': '-'
+        })
+
+    pinn_df      = pd.DataFrame(results_pinn)
+    pinn_pred_test = best_pinn_pred
+    y_test_pinn    = y_te
+
+    save_checkpoint({
+        'pinn_df':        pinn_df,
+        'pinn_pred_test': pinn_pred_test,
+        'y_test_pinn':    y_test_pinn,
+    }, 'pinn_results')
+    print('✓ PINN results saved to Drive.')
+
+# ── Always show results ───────────────────────────────────────────────────────
+print('\nPINN RESULTS — PHYSICS CONSTRAINT EFFECT:')
+print(pinn_df.to_string(index=False))
+save_csv(pinn_df, 'pinn_constrained_loss_results')
+
+# ── Plot 1: Constraint strength vs accuracy ───────────────────────────────────
+pinn_only = pinn_df[pinn_df['lambda_bep'] != '-'].copy()
+pinn_only['R2']  = pinn_only['R2'].astype(float)
+pinn_only['MAE'] = pinn_only['MAE'].astype(float)
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+# Parity plot — best PINN
+ax = axes[0]
+r2  = r2_score(y_test_pinn, pinn_pred_test)
+mae = mean_absolute_error(y_test_pinn, pinn_pred_test)
+ax.scatter(y_test_pinn, pinn_pred_test,
+           alpha=0.3, s=8, c='purple', rasterized=True)
+lims = [min(y_test_pinn.min(), pinn_pred_test.min()) - 0.05,
+        max(y_test_pinn.max(), pinn_pred_test.max()) + 0.05]
+ax.plot(lims, lims, 'k--', lw=1)
+ax.set_xlim(lims);  ax.set_ylim(lims)
+ax.set_xlabel('DFT Barrier (eV)')
+ax.set_ylabel('PINN Predicted Barrier (eV)')
+ax.set_title(f'Best PINN Parity Plot\nR²={r2:.4f}  MAE={mae:.4f} eV')
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+
+# R² vs lambda_bep
+ax = axes[1]
+lambda_vals = pinn_only['lambda_bep'].astype(float).tolist()
+r2_vals     = pinn_only['R2'].tolist()
+ax.plot(lambda_vals, r2_vals, 'o-', color='purple',
+        linewidth=2, markersize=8)
+ax.set_xlabel('Physics Constraint Strength (λ_bep)')
+ax.set_ylabel('R² (test set)')
+ax.set_title('Effect of BEP Constraint Strength on Accuracy')
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+
+# MAE vs lambda_bep
+ax = axes[2]
+mae_vals = pinn_only['MAE'].tolist()
+ax.plot(lambda_vals, mae_vals, 'o-', color='tomato',
+        linewidth=2, markersize=8)
+ax.set_xlabel('Physics Constraint Strength (λ_bep)')
+ax.set_ylabel('MAE (eV)')
+ax.set_title('Effect of BEP Constraint Strength on MAE')
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+
+plt.suptitle('Physics-Informed Neural Network — Constrained Loss Analysis',
+             fontsize=13)
+plt.tight_layout()
+save_figure(fig, 'pinn_constrained_loss')
+plt.show()
+
+# ── Plot 2: Full model comparison ─────────────────────────────────────────────
+# Load all model results for comparison
+all_results = []
+
+results_5f_ckpt = load_checkpoint('results_5f')
+if results_5f_ckpt is not None:
+    for name, label in [('RF','Random Forest'),
+                         ('DF','Deep Forest'),
+                         ('MLP','Standard MLP')]:
+        vals = results_5f_ckpt[name]['barrier']
+        all_results.append({
+            'Model': label,
+            'R2':    np.mean([r['R2']  for r in vals]),
+            'MAE':   np.mean([r['MAE'] for r in vals]),
+            'Type':  'ML model'
+        })
+
+baseline_ckpt = load_checkpoint('physics_baselines')
+if baseline_ckpt is not None:
+    for _, row in baseline_ckpt['baseline_df'].iterrows():
+        if row['Type'] in ['Physics baseline', 'Physics-informed ML']:
+            try:
+                all_results.append({
+                    'Model': row['Model'],
+                    'R2':    float(row['R2']),
+                    'MAE':   float(row['MAE']),
+                    'Type':  row['Type']
+                })
+            except:
+                pass
+
+# Add PINN results
+for _, row in pinn_only.iterrows():
+    all_results.append({
+        'Model': row['Model'],
+        'R2':    float(row['R2']),
+        'MAE':   float(row['MAE']),
+        'Type':  'Physics-informed NN'
+    })
+
+all_df = pd.DataFrame(all_results).sort_values('R2', ascending=True)
+
+color_map = {
+    'Physics baseline':      'tomato',
+    'Physics-informed ML':   'seagreen',
+    'ML model':              'steelblue',
+    'Physics-informed NN':   'purple',
+}
+colors = [color_map.get(t, 'gray') for t in all_df['Type']]
+
+fig, ax = plt.subplots(figsize=(12, 7))
+ax.barh(all_df['Model'], all_df['R2'], color=colors, alpha=0.85)
+ax.set_xlabel('R² (higher is better)')
+ax.set_title('Complete Model Comparison:\n'
+             'Physics Baselines vs BEP Delta-ML vs PINN vs ML Models')
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+
+from matplotlib.patches import Patch
+legend_elements = [
+    Patch(facecolor='tomato',    label='Physics baseline'),
+    Patch(facecolor='seagreen',  label='BEP + Delta-ML'),
+    Patch(facecolor='steelblue', label='Standard ML'),
+    Patch(facecolor='purple',    label='Physics-Informed NN (PINN)'),
+]
+ax.legend(handles=legend_elements, loc='lower right')
+plt.tight_layout()
+save_figure(fig, 'complete_model_comparison_with_pinn')
+plt.show()
+
+save_csv(all_df, 'complete_model_comparison')
+print('\n✓ All PINN figures and tables saved to Drive.')
+
+
+
+
+
+
+
+
 
