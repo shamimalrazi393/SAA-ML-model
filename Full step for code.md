@@ -1,7 +1,7 @@
 **SAA Catalyst ML Full Process**
-Step 1 — Environment Setup
-Step 2 — Checkpoint Helper Functions
-Step 3 — Load Dataset and Engineer Features
+-Step 1 — Environment Setup
+-Step 2 — Checkpoint Helper Functions
+-Step 3 — Load Dataset and Engineer Features
 Step 4 — Exploratory Data Analysis (EDA)
 Step 5 — Build Feature Matrix
 Step 5b — matminer + CALPHAD Feature Enrichment
