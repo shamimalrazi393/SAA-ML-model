@@ -1,4 +1,4 @@
-:# **SAA Catalyst ML full Process**
+**SAA Catalyst ML Full Process**
 Step 1 — Environment Setup
 Step 2 — Checkpoint Helper Functions
 Step 3 — Load Dataset and Engineer Features
